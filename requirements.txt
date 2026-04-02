@@ -1,0 +1,6 @@
+langextract[openai]
+pymupdf
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv

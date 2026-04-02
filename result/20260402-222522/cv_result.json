@@ -1,0 +1,94 @@
+{
+  "name": "Denis Defreyne",
+  "email": "hello@denisdefreyne.com",
+  "phone": "+49 1573 1969 173",
+  "phones": [
+    "+49 1573 1969 173"
+  ],
+  "summary": "Denis is a competent senior/staff backend engineer with the experience of solving complex technical challenges found in large-scale, highly-available systems.",
+  "experience": [
+    {
+      "title": "Senior software engineer",
+      "company": "Getsafe",
+      "dates": "Aug 2024 – Jul 2025",
+      "description": null
+    },
+    {
+      "title": "Staff software engineer",
+      "company": "DataGuard",
+      "dates": "Aug 2022 – Apr 2024",
+      "description": null
+    },
+    {
+      "title": "Senior software engineer",
+      "company": "Shopify",
+      "dates": "Jul 2021 – Jun 2022",
+      "description": null
+    },
+    {
+      "title": "Software engineer",
+      "company": "Pitch",
+      "dates": "Feb 2021 – Jun 2021",
+      "description": null
+    },
+    {
+      "title": "Senior full-stack software engineer",
+      "company": "BCG DV",
+      "dates": "Jul 2019 – Dec 2020",
+      "description": null
+    },
+    {
+      "title": "Senior full-stack software engineer",
+      "company": "Movinga",
+      "dates": "Nov 2017 – Jun 2019",
+      "description": null
+    },
+    {
+      "title": "Software engineer, full stack",
+      "company": "SoundCloud",
+      "dates": "Jun 2013 – Nov 2017",
+      "description": null
+    },
+    {
+      "title": "Software developer",
+      "company": "(various)",
+      "dates": "…–2013",
+      "description": null
+    }
+  ],
+  "education": [
+    {
+      "degree": "Master of Science in Computer Science Engineering",
+      "institution": "Ghent University",
+      "dates": "2005–2010, Ghent (Belgium)"
+    }
+  ],
+  "skills": [
+    "Ruby",
+    "HTML",
+    "CSS",
+    "JavaScript",
+    "TypeScript",
+    "Go (Golang)",
+    "Swift",
+    "React",
+    "Ruby on Rails",
+    "AWS",
+    "PostgreSQL",
+    "MySQL",
+    "NoSQL",
+    "Terraform",
+    "Docker",
+    "Git",
+    "GitHub",
+    "GitLab",
+    "Scrum",
+    "Agile",
+    "continuous integration (CI)",
+    "continuous delivery (CD)",
+    "DevOps",
+    "test-driven development (TDD)",
+    "English",
+    "Dutch"
+  ]
+}

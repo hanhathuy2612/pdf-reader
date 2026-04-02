@@ -1,0 +1,53 @@
+{
+  "name": "JOE BLOGGS",
+  "email": "j.bloggs@yahoo.com",
+  "phone": "Apartment 2, Cobh, Co. Cork",
+  "summary": "Professional qualified Electrical Engineer with experience in the Construction and Electronics sectors. Possess excellent organisational and team-working skills.",
+  "experience": [
+    {
+      "title": "Assistant Engineer",
+      "company": "ABC Construction Contractors",
+      "dates": "2003 – 2004",
+      "description": null
+    },
+    {
+      "title": "Trainee Engineer",
+      "company": "Robinson Electronic Design Services",
+      "dates": "2002 – 2003",
+      "description": null
+    },
+    {
+      "title": "Information Assistant",
+      "company": "Aura Gym",
+      "dates": "1999 – 2002",
+      "description": null
+    }
+  ],
+  "education": [
+    {
+      "degree": "Bachelor of Electrical Engineering",
+      "institution": "Cork Institute of Technology",
+      "dates": "1999 – 2003"
+    }
+  ],
+  "skills": [
+    "Programming languages, C, C++",
+    "Access",
+    "Excel",
+    "Word",
+    "PowerPoint",
+    "Matamatica",
+    "Electronics Workbench",
+    "HTML",
+    "VHDL",
+    "Assembly code",
+    "Produce reports and presentations to a professional standard",
+    "Assessing data and formulating solutions",
+    "Time management, prioritising tasks to achieve deadlines",
+    "Team working, leadership and communication skills",
+    "Travel in Australia and Asia during 2003-2004",
+    "Football and rugby regularly, involved in coaching local rugby team",
+    "Play guitar and give guitar lessons",
+    "Driving"
+  ]
+}

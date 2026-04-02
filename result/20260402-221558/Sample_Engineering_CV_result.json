@@ -1,0 +1,46 @@
+{
+  "name": "JOE BLOGGS",
+  "email": "j.bloggs@yahoo.com",
+  "phone": "086 1234567",
+  "phones": [
+    "086 1234567"
+  ],
+  "summary": "Professional qualified Electrical Engineer with experience in the Construction and Electronics sectors. Possess excellent organisational and team-working skills. Career objective: to develop a career within XXX.",
+  "experience": [
+    {
+      "title": "Assistant Engineer",
+      "company": "ABC Construction Contractors, Co. Galway",
+      "dates": "2003 – 2004",
+      "description": "Liaised with Engineers and reported to the Project Manager on all tasks. Conducted demolition work which included working with dangerous chemicals such as asbestos. Completed survey work using laser instruments. Ensured health & safety procedures were adhered to and reported any breaches."
+    },
+    {
+      "title": "Trainee Engineer",
+      "company": "Robinson Electronic Design Services, Co. Cork",
+      "dates": "2002 – 2003",
+      "description": "Reported to the Senior Engineer at the weekly team meeting. Assisted with the designing and building of web pages. Liaised with engineering staff on all aspects of web content relevant to the industry sector. Trained on Microsoft Front Page Editor for web design."
+    },
+    {
+      "title": "Information Assistant",
+      "company": "Aura Gym, Fermoy",
+      "dates": "1999 – 2002",
+      "description": "Checked membership cards at the information desk. Provided assistance and information to customers. Collected money for aerobics and yoga classes. Managed special group bookings of facilities."
+    }
+  ],
+  "education": [
+    {
+      "degree": "Bachelor of Electrical Engineering",
+      "institution": "Cork Institute of Technology",
+      "dates": "1999 – 2003"
+    }
+  ],
+  "skills": [
+    "Working knowledge of programming languages, C, C++.",
+    "HIGHLY proficient at Access, Excel, Word & PowerPoint.",
+    "Knowledge of Matamatica and Electronics Workbench.",
+    "Experience of HTML, VHDL and assembly code.",
+    "Produce reports and presentations to a professional standard.",
+    "Proficient in assessing data and formulating solutions.",
+    "Effective at time management and prioritising tasks to achieve deadlines.",
+    "Strong team working, leadership and communication skills."
+  ]
+}
