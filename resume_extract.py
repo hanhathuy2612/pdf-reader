@@ -20,7 +20,31 @@ def _get_model_id() -> str:
     return "qwen2.5-14b-instruct-1m"
 
 
+def _create_openai_client() -> tuple[Any, int | None]:
+    try:
+        from openai import OpenAI
+    except ImportError as e:
+        raise RuntimeError(
+            "openai package is required. Run: pip install langextract[openai]"
+        ) from e
+
+    base_url = (
+        os.environ.get("LM_STUDIO_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or ""
+    ).strip()
+    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip() or "lm-studio"
+    raw_max_tokens = (os.environ.get("LOCAL_MAX_OUTPUT_TOKENS") or "").strip()
+    max_tokens = int(raw_max_tokens) if raw_max_tokens else None
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url.rstrip("/") if base_url else None,
+    )
+    return client, max_tokens
+
+
 _PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{7,}\d")
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 _BULLET_PREFIX_RE = re.compile(r"^[•●▪◦‣]\s*")
 _MONTH_TOKEN = (
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|"
@@ -274,6 +298,45 @@ def _extract_summary_from_text(text: str) -> str | None:
         ):
             return line
     return None
+
+
+def _guess_name_from_text(text: str) -> str | None:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    for line in lines[:12]:
+        if "@" in line or line.startswith(("http://", "https://")):
+            continue
+        if _is_phone_like(line):
+            continue
+        if re.search(r"\d", line):
+            continue
+        if len(line.split()) >= 2 and len(line) <= 60:
+            return line.title()
+    return None
+
+
+def _build_raw_fallback_from_text(source_text: str) -> JsonDict:
+    emails = _EMAIL_RE.findall(source_text or "")
+    phones = [_normalize_phone(m.group(0)) for m in _PHONE_RE.finditer(source_text or "")]
+    phones = _dedup_keep_order([p for p in phones if _is_phone_like(p)])
+    basics: JsonDict = {
+        "name": _guess_name_from_text(source_text),
+        "emails": _dedup_keep_order(emails),
+        "phones": phones,
+        "location": None,
+        "summary": _extract_summary_from_text(source_text),
+    }
+    return {
+        "basics": basics,
+        "experience": [dict(x) for x in _extract_experience_headers(source_text)],
+        "education": [],
+        "skills": [],
+        "projects": [],
+        "publications": [],
+        "awards": [],
+        "certifications": [],
+        "languages": [],
+        "extra_sections": [],
+    }
 
 
 def _is_probable_role_title(line: str) -> bool:
@@ -601,7 +664,9 @@ def _coerce_raw_to_schema_dict(payload: JsonDict) -> JsonDict:
     }
 
 
-def _normalize_model_payload(payload: JsonDict, source_text: str) -> ResumeExtraction:
+def _normalize_model_payload(
+    payload: JsonDict, source_text: str, apply_text_fallback: bool = True
+) -> ResumeExtraction:
     """Lightweight normalization only — keep model output as-is as much as possible."""
     data: dict[str, Any] = dict(payload)
 
@@ -610,8 +675,8 @@ def _normalize_model_payload(payload: JsonDict, source_text: str) -> ResumeExtra
         data = dict(data["result"])
 
     data = _coerce_raw_to_schema_dict(data)
-
-    data = _repair_with_text_fallback(data, source_text)
+    if apply_text_fallback:
+        data = _repair_with_text_fallback(data, source_text)
 
     # Keep only first email if multiple are joined in one string.
     email = data.get("email")
@@ -674,21 +739,8 @@ def _normalize_model_payload(payload: JsonDict, source_text: str) -> ResumeExtra
 
 def _extract_raw_resume_json_openai(text: str, model_id: str) -> JsonDict:
     """Step 1: ask model to return a rich, free-form resume JSON (lossless-first)."""
-    try:
-        from openai import OpenAI
-    except ImportError as e:
-        raise RuntimeError(
-            "openai package is required. Run: pip install langextract[openai]"
-        ) from e
-
-    base_url = (
-        os.environ.get("LM_STUDIO_BASE_URL")
-        or os.environ.get("OPENAI_BASE_URL")
-        or ""
-    ).strip()
-    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip() or "lm-studio"
-    max_tokens = int((os.environ.get("LOCAL_MAX_OUTPUT_TOKENS") or "2000").strip())
-    logger.info("using model_id=%s base_url=%s", model_id, base_url or "default")
+    client, max_tokens = _create_openai_client()
+    logger.info("using model_id=%s for raw extraction", model_id)
 
     system_prompt = (
         "You extract resume information from noisy PDF text. "
@@ -712,24 +764,23 @@ def _extract_raw_resume_json_openai(text: str, model_id: str) -> JsonDict:
         f"Resume text:\n{text}"
     )
 
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url.rstrip("/") if base_url else None,
-    )
-    logger.info("model_id=%s base_url=%s", model_id, base_url or "default")
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    resp = client.chat.completions.create(
-        model=model_id,
-        messages=messages,
-        temperature=0,
-        max_tokens=max_tokens,
-    )
+    request_args: JsonDict = {
+        "model": model_id,
+        "messages": messages,
+        "temperature": 0,
+    }
+    if max_tokens is not None:
+        request_args["max_tokens"] = max_tokens
+    resp = client.chat.completions.create(**request_args)
+    
     content = (resp.choices[0].message.content or "").strip()
     if not content:
-        raise RuntimeError("Model returned empty response")
+        logger.warning("raw extraction returned empty content; using text fallback")
+        return _augment_raw_payload_with_text(_build_raw_fallback_from_text(text), text)
 
     parsed = _parse_json_dict_loose(content)
     if parsed is not None:
@@ -740,21 +791,101 @@ def _extract_raw_resume_json_openai(text: str, model_id: str) -> JsonDict:
         "Rewrite the previous assistant output as strict valid JSON only. "
         "Do not add or remove keys. Return one JSON object."
     )
-    repair_resp = client.chat.completions.create(
-        model=model_id,
-        messages=[
+    repair_args: JsonDict = {
+        "model": model_id,
+        "messages": [
             *messages,
             {"role": "assistant", "content": content},
             {"role": "user", "content": repair_prompt},
         ],
-        temperature=0,
-        max_tokens=max_tokens,
-    )
+        "temperature": 0,
+    }
+    if max_tokens is not None:
+        repair_args["max_tokens"] = max_tokens
+    repair_resp = client.chat.completions.create(**repair_args)
     repaired_content = (repair_resp.choices[0].message.content or "").strip()
     repaired = _parse_json_dict_loose(repaired_content)
     if repaired is not None:
         return _augment_raw_payload_with_text(repaired, text)
 
+    logger.warning("raw extraction returned invalid JSON; using text fallback")
+    return _augment_raw_payload_with_text(_build_raw_fallback_from_text(text), text)
+
+
+def _normalize_raw_to_schema_openai(
+    raw_payload: JsonDict, source_text: str, model_id: str
+) -> JsonDict:
+    """Step 2: normalize raw JSON to strict project schema via prompt."""
+    client, max_tokens = _create_openai_client()
+    schema_guide = {
+        "name": "string|null",
+        "email": "string|null",
+        "phone": "string|null",
+        "phones": ["string"],
+        "summary": "string|null",
+        "experience": [
+            {
+                "title": "string",
+                "company": "string",
+                "dates": "string|null",
+                "description": "string|null",
+            }
+        ],
+        "education": [{"degree": "string", "institution": "string", "dates": "string|null"}],
+        "skills": ["string"],
+    }
+    system_prompt = (
+        "You normalize resume data into a strict target JSON schema. "
+        "Return one valid JSON object only."
+    )
+    user_prompt = (
+        "Map RAW_JSON into TARGET_SCHEMA.\n"
+        "Rules:\n"
+        "1) Keep as much mappable information as possible.\n"
+        "2) Do not invent facts. Use SOURCE_TEXT only for disambiguation.\n"
+        "3) Preserve all valid experience and education entries.\n"
+        "4) If an entry misses required fields and cannot be inferred, drop that entry only.\n"
+        "5) Return strict JSON only.\n\n"
+        f"TARGET_SCHEMA:\n{json.dumps(schema_guide, ensure_ascii=False)}\n\n"
+        f"RAW_JSON:\n{json.dumps(raw_payload, ensure_ascii=False)}\n\n"
+        f"SOURCE_TEXT:\n{source_text}"
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    request_args: JsonDict = {
+        "model": model_id,
+        "messages": messages,
+        "temperature": 0,
+    }
+    if max_tokens is not None:
+        request_args["max_tokens"] = max_tokens
+    resp = client.chat.completions.create(**request_args)
+    content = (resp.choices[0].message.content or "").strip()
+    parsed = _parse_json_dict_loose(content)
+    if parsed is not None:
+        return parsed
+
+    repair_prompt = (
+        "Rewrite the previous assistant output as strict valid JSON for TARGET_SCHEMA. "
+        "Return one JSON object only."
+    )
+    repair_args: JsonDict = {
+        "model": model_id,
+        "messages": [
+            *messages,
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": repair_prompt},
+        ],
+        "temperature": 0,
+    }
+    if max_tokens is not None:
+        repair_args["max_tokens"] = max_tokens
+    repair_resp = client.chat.completions.create(**repair_args)
+    repaired = _parse_json_dict_loose((repair_resp.choices[0].message.content or "").strip())
+    if repaired is not None:
+        return repaired
     raise RuntimeError("Model response is not valid JSON")
 
 
@@ -762,7 +893,7 @@ def extract_resume_with_raw(text: str) -> tuple[ResumeExtraction, dict[str, Any]
     """
     Two-step extraction:
     1) Model produces a rich/free-form raw JSON (max information retention).
-    2) Deterministic normalization maps raw JSON to project schema.
+    2) Prompt-based normalization maps raw JSON to project schema.
     """
     if not (text or "").strip():
         return ResumeExtraction(), {}
@@ -770,7 +901,16 @@ def extract_resume_with_raw(text: str) -> tuple[ResumeExtraction, dict[str, Any]
     model_id = _get_model_id()
     preprocessed_text = _preprocess_resume_text(text.strip())
     raw_payload = _extract_raw_resume_json_openai(preprocessed_text, model_id)
-    normalized = _normalize_model_payload(raw_payload, preprocessed_text)
+    try:
+        normalized_payload = _normalize_raw_to_schema_openai(
+            raw_payload, preprocessed_text, model_id
+        )
+        normalized = _normalize_model_payload(
+            normalized_payload, preprocessed_text, apply_text_fallback=False
+        )
+    except Exception:
+        # Safe fallback if step-2 model normalization fails.
+        normalized = _normalize_model_payload(raw_payload, preprocessed_text)
     return normalized, raw_payload
 
 
