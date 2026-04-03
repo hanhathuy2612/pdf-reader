@@ -18,6 +18,24 @@ def _get_model_id() -> str:
 
 
 _PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{7,}\d")
+_BULLET_PREFIX_RE = re.compile(r"^[•●▪◦‣]\s*")
+_MONTH_TOKEN = (
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|"
+    r"January|February|March|April|May|June|July|August|September|October|November|December)"
+)
+_DATE_RANGE_RE = re.compile(
+    rf"(?:{_MONTH_TOKEN}\s+\d{{4}}\s*[–-]\s*(?:{_MONTH_TOKEN}\s+\d{{4}}|Present))|(?:…\s*[–-]\s*\d{{4}})"
+)
+_KNOWN_SECTIONS: dict[str, str] = {
+    "work experience": "WORK_EXPERIENCE",
+    "experience": "WORK_EXPERIENCE",
+    "education": "EDUCATION",
+    "core skills": "SKILLS",
+    "skills": "SKILLS",
+    "technical writing": "TECHNICAL_WRITING",
+    "community impact": "COMMUNITY_IMPACT",
+    "public speaking": "PUBLIC_SPEAKING",
+}
 
 
 def _dedup_keep_order(items: list[str]) -> list[str]:
@@ -59,13 +77,285 @@ def _extract_json_candidates(text: str) -> list[str]:
     return candidates
 
 
-def _normalize_model_payload(payload: dict[str, Any]) -> ResumeExtraction:
+def _extract_balanced_json_object(text: str) -> str | None:
+    s = text or ""
+    start = s.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    escaped = False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return s[start : i + 1]
+    return None
+
+
+def _parse_json_dict_loose(text: str) -> dict[str, Any] | None:
+    for candidate in _extract_json_candidates(text):
+        attempt = candidate.strip()
+        if not attempt:
+            continue
+        raw_attempts = [
+            attempt,
+            re.sub(r",\s*([}\]])", r"\1", attempt),  # remove trailing commas
+        ]
+        balanced = _extract_balanced_json_object(attempt)
+        if balanced:
+            raw_attempts.extend(
+                [
+                    balanced,
+                    re.sub(r",\s*([}\]])", r"\1", balanced),
+                ]
+            )
+
+        for raw in raw_attempts:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                continue
+    return None
+
+
+def _looks_like_standalone_label(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+    if re.search(r"[.:;!?]", s):
+        return False
+    words = s.split()
+    if len(words) > 6:
+        return False
+    titled = 0
+    for w in words:
+        token = re.sub(r"[^A-Za-z0-9/&()\-]", "", w)
+        if not token:
+            continue
+        if token.isupper() or re.match(r"^[A-Z][a-z].*", token):
+            titled += 1
+    return titled >= max(1, len(words) - 1)
+
+
+def _normalize_line(line: str) -> str:
+    s = (line or "").strip()
+    if not s:
+        return ""
+    # Normalize common PDF artifacts and Unicode bullets.
+    s = s.replace("\u00ad", "")  # soft hyphen
+    s = s.replace("\u2010", "-").replace("\u2011", "-").replace("\u2212", "-")
+    s = _BULLET_PREFIX_RE.sub("- ", s)
+    if s in {"•", "●", "▪", "◦", "‣", "-"}:
+        return "-"
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _is_section_heading(line: str) -> str | None:
+    key = (line or "").strip().lower()
+    return _KNOWN_SECTIONS.get(key)
+
+
+def _preprocess_resume_text(text: str) -> str:
+    lines = [_normalize_line(line) for line in (text or "").splitlines()]
+    out: list[str] = []
+
+    for line in lines:
+        if not line:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+
+        section = _is_section_heading(line)
+        if section:
+            if out and out[-1] != "":
+                out.append("")
+            out.append(f"[SECTION: {section}]")
+            out.append(line)
+            continue
+
+        if not out or out[-1] == "":
+            out.append(line)
+            continue
+
+        prev = out[-1]
+        is_prev_bullet = prev.startswith("- ")
+        is_curr_bullet = line.startswith("- ")
+        should_join = (
+            not is_prev_bullet
+            and not is_curr_bullet
+            and not prev.endswith((".", "!", "?", ":", ";"))
+            and not _looks_like_standalone_label(prev)
+            and not _looks_like_standalone_label(line)
+        )
+
+        if should_join:
+            # Preserve hyphenated words split across line breaks.
+            if prev.endswith("-"):
+                out[-1] = prev[:-1] + line
+            else:
+                out[-1] = f"{prev} {line}"
+        else:
+            out.append(line)
+
+    processed = "\n".join(out).strip()
+    return processed or (text or "").strip()
+
+
+def _extract_summary_from_text(text: str) -> str | None:
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    for line in lines:
+        low = line.lower()
+        if low in {
+            "work experience",
+            "education",
+            "core skills",
+            "skills",
+            "community impact",
+            "public speaking",
+            "technical writing",
+        }:
+            break
+        if (
+            len(line) >= 50
+            and "@" not in line
+            and not _is_phone_like(line)
+            and not line.startswith(("http://", "https://"))
+        ):
+            return line
+    return None
+
+
+def _is_probable_role_title(line: str) -> bool:
+    s = (line or "").strip()
+    if not s or len(s) > 80:
+        return False
+    low = s.lower()
+    keywords = (
+        "engineer",
+        "developer",
+        "manager",
+        "lecturer",
+        "coordinator",
+        "analyst",
+        "consultant",
+        "architect",
+        "intern",
+    )
+    return any(k in low for k in keywords)
+
+
+def _is_probable_company(line: str) -> bool:
+    s = (line or "").strip()
+    if not s or len(s) > 80:
+        return False
+    if any(ch in s for ch in [".", ",", ";", ":"]):
+        return False
+    words = s.split()
+    if len(words) > 6:
+        return False
+    if _is_probable_role_title(s):
+        return False
+    return bool(re.search(r"[A-Za-z]", s))
+
+
+def _extract_experience_headers(text: str) -> list[dict[str, str | None]]:
+    rows: list[dict[str, str | None]] = []
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    for i, line in enumerate(lines):
+        if not _DATE_RANGE_RE.search(line):
+            continue
+
+        company: str | None = None
+        title: str | None = None
+
+        for j in range(i - 1, max(-1, i - 7), -1):
+            candidate = lines[j]
+            if candidate.startswith(("[SECTION:", "- ")):
+                continue
+            if _is_probable_company(candidate):
+                company = candidate
+                for k in range(j - 1, max(-1, j - 6), -1):
+                    maybe_title = lines[k]
+                    if maybe_title.startswith(("[SECTION:", "- ")):
+                        continue
+                    if _is_probable_role_title(maybe_title):
+                        title = maybe_title
+                        break
+                break
+
+        if title and company:
+            rows.append(
+                {
+                    "title": title,
+                    "company": company,
+                    "dates": line,
+                    "description": None,
+                }
+            )
+
+    unique: list[dict[str, str | None]] = []
+    seen: set[str] = set()
+    for row in rows:
+        key = f"{row['title']}|{row['company']}|{row['dates']}".lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
+
+
+def _repair_with_text_fallback(data: dict[str, Any], source_text: str) -> dict[str, Any]:
+    repaired = dict(data)
+    if not repaired.get("summary"):
+        fallback_summary = _extract_summary_from_text(source_text)
+        if fallback_summary:
+            repaired["summary"] = fallback_summary
+
+    extracted_exp = _extract_experience_headers(source_text)
+    current_exp = repaired.get("experience")
+    if not isinstance(current_exp, list):
+        current_exp = []
+    current_exp = [x for x in current_exp if isinstance(x, dict)]
+
+    if len(current_exp) < len(extracted_exp):
+        existing_keys = {
+            f"{(x.get('title') or '').strip().lower()}|{(x.get('company') or '').strip().lower()}|{(x.get('dates') or '').strip().lower()}"
+            for x in current_exp
+        }
+        for row in extracted_exp:
+            key = f"{(row.get('title') or '').strip().lower()}|{(row.get('company') or '').strip().lower()}|{(row.get('dates') or '').strip().lower()}"
+            if key not in existing_keys:
+                current_exp.append(row)
+        repaired["experience"] = current_exp
+
+    return repaired
+
+
+def _normalize_model_payload(payload: dict[str, Any], source_text: str) -> ResumeExtraction:
     """Lightweight normalization only — keep model output as-is as much as possible."""
     data: dict[str, Any] = dict(payload)
 
     # Some models wrap with {"result": {...}}
     if "result" in data and isinstance(data["result"], dict):
         data = dict(data["result"])
+
+    data = _repair_with_text_fallback(data, source_text)
 
     # Keep only first email if multiple are joined in one string.
     email = data.get("email")
@@ -144,14 +434,42 @@ def _extract_resume_direct_openai(text: str, model_id: str) -> ResumeExtraction:
     max_tokens = int((os.environ.get("LOCAL_MAX_OUTPUT_TOKENS") or "2000").strip())
     logger.info("using model_id=%s base_url=%s", model_id, base_url or "default")
 
-    schema_json = json.dumps(ResumeExtraction.model_json_schema(), ensure_ascii=False)
+    compact_schema = {
+        "name": "string|null",
+        "email": "string|null",
+        "phone": "string|null",
+        "phones": ["string"],
+        "summary": "string|null",
+        "experience": [
+            {
+                "title": "string",
+                "company": "string",
+                "dates": "string|null",
+                "description": "string|null",
+            }
+        ],
+        "education": [{"degree": "string", "institution": "string", "dates": "string|null"}],
+        "skills": ["string"],
+    }
     system_prompt = (
-        "Extract structured resume information. "
-        "Return valid JSON only, no markdown, no extra text."
+        "You extract structured resume information from noisy PDF text. "
+        "Return valid JSON only (no markdown, no prose). "
+        "Follow the schema exactly and preserve the original structure."
+    )
+    extraction_rules = (
+        "Extraction rules:\n"
+        "1) Keep the output strictly schema-compliant.\n"
+        "2) For each experience item, always capture title/company/dates when present.\n"
+        "3) Assign achievement/responsibility bullets only when role linkage is clear.\n"
+        "4) If role linkage is ambiguous, keep description as null instead of guessing.\n"
+        "5) Join multiple bullet lines into one concise description string when assigned.\n"
+        "6) Prefer correctness of mapping over completeness of descriptions.\n"
+        "7) Do not invent facts not present in the resume text.\n"
     )
     user_prompt = (
         "Extract resume information from this text and follow the schema strictly.\n\n"
-        f"Schema:\n{schema_json}\n\n"
+        f"{extraction_rules}\n"
+        f"Schema:\n{json.dumps(compact_schema, ensure_ascii=False)}\n\n"
         f"Resume text:\n{text}"
     )
 
@@ -159,12 +477,13 @@ def _extract_resume_direct_openai(text: str, model_id: str) -> ResumeExtraction:
         api_key=api_key,
         base_url=base_url.rstrip("/") if base_url else None,
     )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
     resp = client.chat.completions.create(
         model=model_id,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        messages=messages,
         temperature=0,
         max_tokens=max_tokens,
     )
@@ -172,13 +491,29 @@ def _extract_resume_direct_openai(text: str, model_id: str) -> ResumeExtraction:
     if not content:
         raise RuntimeError("Model returned empty response")
 
-    for candidate in _extract_json_candidates(content):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return _normalize_model_payload(parsed)
-        except Exception:
-            continue
+    parsed = _parse_json_dict_loose(content)
+    if parsed is not None:
+        return _normalize_model_payload(parsed, text)
+
+    # Retry once with explicit JSON-fix instruction for smaller models.
+    repair_prompt = (
+        "Rewrite the previous assistant output as strict valid JSON only. "
+        "Do not add or remove keys. Return one JSON object."
+    )
+    repair_resp = client.chat.completions.create(
+        model=model_id,
+        messages=[
+            *messages,
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": repair_prompt},
+        ],
+        temperature=0,
+        max_tokens=max_tokens,
+    )
+    repaired_content = (repair_resp.choices[0].message.content or "").strip()
+    repaired = _parse_json_dict_loose(repaired_content)
+    if repaired is not None:
+        return _normalize_model_payload(repaired, text)
 
     raise RuntimeError("Model response is not valid JSON")
 
@@ -193,4 +528,5 @@ def extract_resume(text: str) -> ResumeExtraction:
     if not (text or "").strip():
         return ResumeExtraction()
     model_id = _get_model_id()
-    return _extract_resume_direct_openai(text.strip(), model_id)
+    preprocessed_text = _preprocess_resume_text(text.strip())
+    return _extract_resume_direct_openai(preprocessed_text, model_id)

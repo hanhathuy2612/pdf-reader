@@ -145,7 +145,7 @@ async def extract(
     try:
         t_pdf_start = time.perf_counter()
         text = extract_text_from_pdf(raw)
-        t_pdf_ms = (time.perf_counter() - t_pdf_start) * 1000
+        t_pdf_s = time.perf_counter() - t_pdf_start
         artifact_paths = _build_result_paths(file.filename)
         _write_debug_artifacts(artifact_paths, text)
     except ValueError as e:
@@ -156,20 +156,23 @@ async def extract(
     try:
         t_llm_start = time.perf_counter()
         result = extract_resume(text)
-        t_llm_ms = (time.perf_counter() - t_llm_start) * 1000
+        t_llm_s = time.perf_counter() - t_llm_start
         _write_debug_artifacts(artifact_paths, text, result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {e}")
 
-    t_total_ms = (time.perf_counter() - t0) * 1000
+    t_total_s = time.perf_counter() - t0
     logger.info(
-        "extract completed file=%s bytes=%d chars=%d pdf_ms=%.1f llm_ms=%.1f total_ms=%.1f",
+        (
+            "extract completed | file=%s | bytes=%d | chars=%d | "
+            "timings={pdf: %.3fs, llm: %.3fs, total: %.3fs}"
+        ),
         file.filename,
         len(raw),
         len(text or ""),
-        t_pdf_ms,
-        t_llm_ms,
-        t_total_ms,
+        t_pdf_s,
+        t_llm_s,
+        t_total_s,
     )
 
     return result
