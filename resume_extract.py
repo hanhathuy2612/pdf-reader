@@ -746,21 +746,11 @@ def _extract_raw_resume_json_openai(text: str, model_id: str) -> JsonDict:
         "You extract resume information from noisy PDF text. "
         "Return one valid JSON object only (no markdown, no prose)."
     )
-    raw_json_guide = (
-        "{"
-        '"basics": {"name": "...", "emails": ["..."], "phones": ["..."], "location": "...", "summary": "..."},'
-        '"experience": [{"title":"...","company":"...","dates":"...","description":"...","highlights":["..."]}],'
-        '"education": [{"degree":"...","institution":"...","dates":"..."}],'
-        '"skills": ["..."],'
-        '"projects": [], "publications": [], "awards": [], "certifications": [], "languages": [],'
-        '"extra_sections": [{"section":"...","items":["..."]}]'
-        "}"
-    )
     user_prompt = (
         "Extract as much information as possible from this resume text.\n"
-        "Do not lose data. Prefer filling extra_sections over dropping information.\n"
-        "If a field is unknown, use null or empty array.\n\n"
-        f"Suggested JSON shape:\n{raw_json_guide}\n\n"
+        "Return one JSON object with your own best structure.\n"
+        "Do not lose data and do not add markdown/prose.\n"
+        "Use null/empty arrays only when information is missing.\n\n"
         f"Resume text:\n{text}"
     )
 
@@ -779,12 +769,11 @@ def _extract_raw_resume_json_openai(text: str, model_id: str) -> JsonDict:
     
     content = (resp.choices[0].message.content or "").strip()
     if not content:
-        logger.warning("raw extraction returned empty content; using text fallback")
-        return _augment_raw_payload_with_text(_build_raw_fallback_from_text(text), text)
+        raise RuntimeError("Model returned empty response")
 
     parsed = _parse_json_dict_loose(content)
     if parsed is not None:
-        return _augment_raw_payload_with_text(parsed, text)
+        return parsed
 
     # Retry once with explicit JSON-fix instruction for smaller models.
     repair_prompt = (
@@ -806,10 +795,9 @@ def _extract_raw_resume_json_openai(text: str, model_id: str) -> JsonDict:
     repaired_content = (repair_resp.choices[0].message.content or "").strip()
     repaired = _parse_json_dict_loose(repaired_content)
     if repaired is not None:
-        return _augment_raw_payload_with_text(repaired, text)
+        return repaired
 
-    logger.warning("raw extraction returned invalid JSON; using text fallback")
-    return _augment_raw_payload_with_text(_build_raw_fallback_from_text(text), text)
+    raise RuntimeError("Model response is not valid JSON")
 
 
 def _normalize_raw_to_schema_openai(
@@ -848,7 +836,6 @@ def _normalize_raw_to_schema_openai(
         "5) Return strict JSON only.\n\n"
         f"TARGET_SCHEMA:\n{json.dumps(schema_guide, ensure_ascii=False)}\n\n"
         f"RAW_JSON:\n{json.dumps(raw_payload, ensure_ascii=False)}\n\n"
-        f"SOURCE_TEXT:\n{source_text}"
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -906,7 +893,7 @@ def extract_resume_with_raw(text: str) -> tuple[ResumeExtraction, dict[str, Any]
             raw_payload, preprocessed_text, model_id
         )
         normalized = _normalize_model_payload(
-            normalized_payload, preprocessed_text, apply_text_fallback=False
+            normalized_payload, preprocessed_text, apply_text_fallback=True
         )
     except Exception:
         # Safe fallback if step-2 model normalization fails.
