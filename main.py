@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from pdf_reader import extract_text_from_pdf
-from resume_extract import extract_resume
+from resume_extract import extract_resume_with_raw
 
 ARTIFACTS_DIR = Path(__file__).resolve().parent
 RESULTS_ROOT = ARTIFACTS_DIR / "result"
@@ -26,7 +26,7 @@ def _slugify_filename(name: str) -> str:
     return safe or "resume"
 
 
-def _build_result_paths(pdf_path: Path) -> tuple[Path, Path]:
+def _build_result_paths(pdf_path: Path) -> tuple[Path, Path, Path]:
     RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = RESULTS_ROOT / timestamp
@@ -34,8 +34,9 @@ def _build_result_paths(pdf_path: Path) -> tuple[Path, Path]:
 
     stem = _slugify_filename(pdf_path.stem)
     input_path = run_dir / f"{stem}_input-pdf.txt"
+    raw_path = run_dir / f"{stem}_raw-result.json"
     result_path = run_dir / f"{stem}_result.json"
-    return input_path, result_path
+    return input_path, raw_path, result_path
 
 
 def cmd_extract(pdf_path: str, output_path: str | None) -> int:
@@ -50,15 +51,19 @@ def cmd_extract(pdf_path: str, output_path: str | None) -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
 
-    input_path, result_path = _build_result_paths(path)
+    input_path, raw_path, result_path = _build_result_paths(path)
     input_path.write_text(text or "", encoding="utf-8")
 
     try:
-        result = extract_resume(text)
+        result, raw_result = extract_resume_with_raw(text)
     except Exception as e:
         print(f"Extraction error: {e}", file=sys.stderr)
         return 1
 
+    raw_path.write_text(
+        json.dumps(raw_result, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
     data = result.model_dump(mode="json")
     json_str = json.dumps(data, indent=2, ensure_ascii=False)
     result_path.write_text(json_str, encoding="utf-8")

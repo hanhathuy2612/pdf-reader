@@ -10,6 +10,9 @@ from schemas import EducationItem, ExperienceItem, ResumeExtraction
 
 logger = logging.getLogger("resume_extract")
 
+JsonDict = dict[str, Any]
+ExperienceRow = dict[str, str | None]
+
 def _get_model_id() -> str:
     model = (os.environ.get("MODEL_ID") or "").strip()
     if model:
@@ -35,6 +38,20 @@ _KNOWN_SECTIONS: dict[str, str] = {
     "technical writing": "TECHNICAL_WRITING",
     "community impact": "COMMUNITY_IMPACT",
     "public speaking": "PUBLIC_SPEAKING",
+}
+_NOISE_COMPANY_VALUES = {
+    "nanoc",
+    "core skills",
+    "public speaking",
+    "technical writing",
+    "community impact",
+    "open-source projects",
+    "programming/markup languages",
+    "technologies",
+    "tools",
+    "processes",
+    "natural languages",
+    "other interests",
 }
 
 
@@ -77,6 +94,24 @@ def _extract_json_candidates(text: str) -> list[str]:
     return candidates
 
 
+def _join_nonempty_text(items: Any, sep: str = "; ") -> str | None:
+    if isinstance(items, str):
+        value = items.strip()
+        return value or None
+    if not isinstance(items, list):
+        return None
+    values = [str(x).strip() for x in items if str(x).strip()]
+    return sep.join(values) if values else None
+
+
+def _experience_identity(row: dict[str, Any]) -> str:
+    return (
+        f"{(row.get('title') or '').strip().lower()}|"
+        f"{(row.get('company') or '').strip().lower()}|"
+        f"{(row.get('dates') or '').strip().lower()}"
+    )
+
+
 def _extract_balanced_json_object(text: str) -> str | None:
     s = text or ""
     start = s.find("{")
@@ -106,7 +141,7 @@ def _extract_balanced_json_object(text: str) -> str | None:
     return None
 
 
-def _parse_json_dict_loose(text: str) -> dict[str, Any] | None:
+def _parse_json_dict_loose(text: str) -> JsonDict | None:
     for candidate in _extract_json_candidates(text):
         attempt = candidate.strip()
         if not attempt:
@@ -264,6 +299,10 @@ def _is_probable_company(line: str) -> bool:
     s = (line or "").strip()
     if not s or len(s) > 80:
         return False
+    if s.lower() in _KNOWN_SECTIONS:
+        return False
+    if s.lower() in _NOISE_COMPANY_VALUES:
+        return False
     if any(ch in s for ch in [".", ",", ";", ":"]):
         return False
     words = s.split()
@@ -274,30 +313,49 @@ def _is_probable_company(line: str) -> bool:
     return bool(re.search(r"[A-Za-z]", s))
 
 
-def _extract_experience_headers(text: str) -> list[dict[str, str | None]]:
-    rows: list[dict[str, str | None]] = []
+def _extract_experience_headers(text: str) -> list[ExperienceRow]:
+    rows: list[ExperienceRow] = []
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     for i, line in enumerate(lines):
-        if not _DATE_RANGE_RE.search(line):
+        date_match = _DATE_RANGE_RE.search(line)
+        if not date_match:
+            continue
+        # Fallback parser should only consume lines that are mostly a date range.
+        if date_match.group(0).strip() != line.strip():
             continue
 
         company: str | None = None
         title: str | None = None
 
-        for j in range(i - 1, max(-1, i - 7), -1):
-            candidate = lines[j]
-            if candidate.startswith(("[SECTION:", "- ")):
+        # Prefer a title->company pair directly above the date line.
+        for j in range(i - 2, max(-1, i - 12), -1):
+            maybe_title = lines[j]
+            if maybe_title.startswith(("[SECTION:", "- ")):
                 continue
-            if _is_probable_company(candidate):
-                company = candidate
-                for k in range(j - 1, max(-1, j - 6), -1):
-                    maybe_title = lines[k]
-                    if maybe_title.startswith(("[SECTION:", "- ")):
-                        continue
-                    if _is_probable_role_title(maybe_title):
-                        title = maybe_title
-                        break
+            if not _is_probable_role_title(maybe_title):
+                continue
+            maybe_company = lines[j + 1] if j + 1 < i else ""
+            if _is_probable_company(maybe_company):
+                title = maybe_title
+                company = maybe_company
                 break
+
+        # Fallback: nearest valid company with title somewhere above.
+        if not (title and company):
+            for j in range(i - 1, max(-1, i - 8), -1):
+                candidate = lines[j]
+                if candidate.startswith(("[SECTION:", "- ")):
+                    continue
+                if _is_probable_company(candidate):
+                    company = candidate
+                    for k in range(j - 1, max(-1, j - 8), -1):
+                        maybe_title = lines[k]
+                        if maybe_title.startswith(("[SECTION:", "- ")):
+                            continue
+                        if _is_probable_role_title(maybe_title):
+                            title = maybe_title
+                            break
+                    break
 
         if title and company:
             rows.append(
@@ -309,10 +367,10 @@ def _extract_experience_headers(text: str) -> list[dict[str, str | None]]:
                 }
             )
 
-    unique: list[dict[str, str | None]] = []
+    unique: list[ExperienceRow] = []
     seen: set[str] = set()
     for row in rows:
-        key = f"{row['title']}|{row['company']}|{row['dates']}".lower()
+        key = _experience_identity(row)
         if key in seen:
             continue
         seen.add(key)
@@ -320,40 +378,238 @@ def _extract_experience_headers(text: str) -> list[dict[str, str | None]]:
     return unique
 
 
-def _repair_with_text_fallback(data: dict[str, Any], source_text: str) -> dict[str, Any]:
+def _repair_with_text_fallback(data: JsonDict, source_text: str) -> JsonDict:
     repaired = dict(data)
     if not repaired.get("summary"):
         fallback_summary = _extract_summary_from_text(source_text)
         if fallback_summary:
             repaired["summary"] = fallback_summary
 
-    extracted_exp = _extract_experience_headers(source_text)
     current_exp = repaired.get("experience")
     if not isinstance(current_exp, list):
         current_exp = []
     current_exp = [x for x in current_exp if isinstance(x, dict)]
 
-    if len(current_exp) < len(extracted_exp):
-        existing_keys = {
-            f"{(x.get('title') or '').strip().lower()}|{(x.get('company') or '').strip().lower()}|{(x.get('dates') or '').strip().lower()}"
-            for x in current_exp
-        }
-        for row in extracted_exp:
-            key = f"{(row.get('title') or '').strip().lower()}|{(row.get('company') or '').strip().lower()}|{(row.get('dates') or '').strip().lower()}"
-            if key not in existing_keys:
-                current_exp.append(row)
+    # Raw-first policy: if model already found enough experience rows, do not
+    # inject heuristic fallback rows from noisy PDF text.
+    if len(current_exp) >= 2:
         repaired["experience"] = current_exp
+        return repaired
+
+    extracted_exp = _extract_experience_headers(source_text)
+    if not extracted_exp:
+        repaired["experience"] = current_exp
+        return repaired
+
+    if not current_exp:
+        repaired["experience"] = extracted_exp
+        return repaired
+
+    existing_keys = {
+        _experience_identity(x)
+        for x in current_exp
+    }
+    for row in extracted_exp:
+        key = _experience_identity(row)
+        if key not in existing_keys:
+            current_exp.append(row)
+    repaired["experience"] = current_exp
 
     return repaired
 
 
-def _normalize_model_payload(payload: dict[str, Any], source_text: str) -> ResumeExtraction:
+def _augment_raw_payload_with_text(raw_payload: JsonDict, source_text: str) -> JsonDict:
+    """Improve raw payload recall using deterministic anchors from source text."""
+    out = dict(raw_payload)
+    basics = out.get("basics")
+    if not isinstance(basics, dict):
+        basics = {}
+    if not basics.get("summary"):
+        summary = _extract_summary_from_text(source_text)
+        if summary:
+            basics["summary"] = summary
+    out["basics"] = basics
+
+    raw_exp = out.get("experience")
+    if not isinstance(raw_exp, list):
+        raw_exp = []
+    raw_exp = [x for x in raw_exp if isinstance(x, dict)]
+
+    anchors = _extract_experience_headers(source_text)
+    if not anchors:
+        out["experience"] = raw_exp
+        return out
+
+    by_date: dict[str, ExperienceRow] = {}
+    for row in anchors:
+        dates = row.get("dates")
+        if isinstance(dates, str) and dates.strip() and dates not in by_date:
+            by_date[dates] = row
+
+    fixed: list[JsonDict] = []
+    for row in raw_exp:
+        updated = dict(row)
+        raw_dates = updated.get("dates")
+        if isinstance(raw_dates, str) and raw_dates in by_date:
+            anchor = by_date[raw_dates]
+            raw_title = str(updated.get("title") or "").strip()
+            raw_company = str(updated.get("company") or "").strip()
+            if not _is_probable_role_title(raw_title):
+                updated["title"] = anchor.get("title")
+            if not _is_probable_company(raw_company):
+                updated["company"] = anchor.get("company")
+        fixed.append(updated)
+
+    existing = {_experience_identity(x) for x in fixed}
+    for row in anchors:
+        key = _experience_identity(row)
+        if key not in existing:
+            fixed.append(dict(row))
+
+    out["experience"] = fixed
+    return out
+
+
+def _pick_first_nonempty_str(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _to_string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, list):
+        return []
+    out: list[str] = []
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    return out
+
+
+def _coerce_raw_to_schema_dict(payload: JsonDict) -> JsonDict:
+    """
+    Convert a free-form/raw resume JSON into the project schema shape.
+    Keeps behavior stable for both strict-schema and arbitrary-schema model outputs.
+    """
+    data = dict(payload)
+    basics = data.get("basics") if isinstance(data.get("basics"), dict) else {}
+    contact = data.get("contact") if isinstance(data.get("contact"), dict) else {}
+    basics_emails = _to_string_list(basics.get("emails"))
+    contact_emails = _to_string_list(contact.get("emails"))
+
+    phones = _to_string_list(data.get("phones"))
+    phones.extend(_to_string_list(basics.get("phones")))
+    phones.extend(_to_string_list(contact.get("phones")))
+    phones.extend(_to_string_list(contact.get("phone_numbers")))
+    primary_phone = _pick_first_nonempty_str(
+        data.get("phone"), basics.get("phone"), contact.get("phone")
+    )
+    if primary_phone:
+        phones.insert(0, primary_phone)
+
+    exp_source = (
+        data.get("experience")
+        or data.get("work_experience")
+        or data.get("work")
+        or data.get("employment")
+        or []
+    )
+    experience: list[dict[str, Any]] = []
+    if isinstance(exp_source, list):
+        for row in exp_source:
+            if not isinstance(row, dict):
+                continue
+            desc = _join_nonempty_text(row.get("description"))
+            if not desc:
+                highlights = (
+                    row.get("highlights")
+                    or row.get("achievements")
+                    or row.get("responsibilities")
+                )
+                desc = _join_nonempty_text(highlights)
+            item = {
+                "title": _pick_first_nonempty_str(
+                    row.get("title"), row.get("position"), row.get("role"), row.get("job_title")
+                ),
+                "company": _pick_first_nonempty_str(
+                    row.get("company"), row.get("employer"), row.get("organization"), row.get("org")
+                ),
+                "dates": _pick_first_nonempty_str(
+                    row.get("dates"), row.get("date_range"), row.get("period"), row.get("duration")
+                ),
+                "description": desc if isinstance(desc, str) else None,
+            }
+            if item["title"] and item["company"]:
+                experience.append(item)
+
+    edu_source = data.get("education") or data.get("academic") or []
+    education: list[dict[str, Any]] = []
+    if isinstance(edu_source, list):
+        for row in edu_source:
+            if not isinstance(row, dict):
+                continue
+            item = {
+                "degree": _pick_first_nonempty_str(
+                    row.get("degree"), row.get("qualification"), row.get("program"), row.get("title")
+                ),
+                "institution": _pick_first_nonempty_str(
+                    row.get("institution"), row.get("school"), row.get("university"), row.get("organization")
+                ),
+                "dates": _pick_first_nonempty_str(
+                    row.get("dates"), row.get("date_range"), row.get("period"), row.get("duration")
+                ),
+            }
+            if item["degree"] and item["institution"]:
+                education.append(item)
+
+    skills_source = data.get("skills") or data.get("core_skills") or data.get("technical_skills") or []
+    skills: list[str] = []
+    if isinstance(skills_source, list):
+        for row in skills_source:
+            if isinstance(row, str) and row.strip():
+                skills.append(row.strip())
+            elif isinstance(row, dict):
+                skills.extend(_to_string_list(row.get("items")))
+    elif isinstance(skills_source, dict):
+        for value in skills_source.values():
+            skills.extend(_to_string_list(value))
+
+    return {
+        "name": _pick_first_nonempty_str(data.get("name"), basics.get("name")),
+        "email": _pick_first_nonempty_str(
+            data.get("email"),
+            basics.get("email"),
+            contact.get("email"),
+            basics_emails[0] if basics_emails else None,
+            contact_emails[0] if contact_emails else None,
+        ),
+        "phone": primary_phone,
+        "phones": phones,
+        "summary": _pick_first_nonempty_str(
+            data.get("summary"),
+            data.get("profile"),
+            data.get("objective"),
+            data.get("about"),
+            basics.get("summary"),
+        ),
+        "experience": experience or data.get("experience") or [],
+        "education": education or data.get("education") or [],
+        "skills": skills or _to_string_list(data.get("skills")),
+    }
+
+
+def _normalize_model_payload(payload: JsonDict, source_text: str) -> ResumeExtraction:
     """Lightweight normalization only — keep model output as-is as much as possible."""
     data: dict[str, Any] = dict(payload)
 
     # Some models wrap with {"result": {...}}
     if "result" in data and isinstance(data["result"], dict):
         data = dict(data["result"])
+
+    data = _coerce_raw_to_schema_dict(data)
 
     data = _repair_with_text_fallback(data, source_text)
 
@@ -396,7 +652,7 @@ def _normalize_model_payload(payload: dict[str, Any], source_text: str) -> Resum
             row = dict(item)
             desc = row.get("description")
             if isinstance(desc, list):
-                row["description"] = "; ".join(str(x).strip() for x in desc if str(x).strip()) or None
+                row["description"] = _join_nonempty_text(desc)
             fixed.append(row)
         data["experience"] = fixed
 
@@ -416,8 +672,8 @@ def _normalize_model_payload(payload: dict[str, Any], source_text: str) -> Resum
     )
 
 
-def _extract_resume_direct_openai(text: str, model_id: str) -> ResumeExtraction:
-    """Direct LM Studio / OpenAI-compatible extraction using a schema-in-prompt approach."""
+def _extract_raw_resume_json_openai(text: str, model_id: str) -> JsonDict:
+    """Step 1: ask model to return a rich, free-form resume JSON (lossless-first)."""
     try:
         from openai import OpenAI
     except ImportError as e:
@@ -434,42 +690,25 @@ def _extract_resume_direct_openai(text: str, model_id: str) -> ResumeExtraction:
     max_tokens = int((os.environ.get("LOCAL_MAX_OUTPUT_TOKENS") or "2000").strip())
     logger.info("using model_id=%s base_url=%s", model_id, base_url or "default")
 
-    compact_schema = {
-        "name": "string|null",
-        "email": "string|null",
-        "phone": "string|null",
-        "phones": ["string"],
-        "summary": "string|null",
-        "experience": [
-            {
-                "title": "string",
-                "company": "string",
-                "dates": "string|null",
-                "description": "string|null",
-            }
-        ],
-        "education": [{"degree": "string", "institution": "string", "dates": "string|null"}],
-        "skills": ["string"],
-    }
     system_prompt = (
-        "You extract structured resume information from noisy PDF text. "
-        "Return valid JSON only (no markdown, no prose). "
-        "Follow the schema exactly and preserve the original structure."
+        "You extract resume information from noisy PDF text. "
+        "Return one valid JSON object only (no markdown, no prose)."
     )
-    extraction_rules = (
-        "Extraction rules:\n"
-        "1) Keep the output strictly schema-compliant.\n"
-        "2) For each experience item, always capture title/company/dates when present.\n"
-        "3) Assign achievement/responsibility bullets only when role linkage is clear.\n"
-        "4) If role linkage is ambiguous, keep description as null instead of guessing.\n"
-        "5) Join multiple bullet lines into one concise description string when assigned.\n"
-        "6) Prefer correctness of mapping over completeness of descriptions.\n"
-        "7) Do not invent facts not present in the resume text.\n"
+    raw_json_guide = (
+        "{"
+        '"basics": {"name": "...", "emails": ["..."], "phones": ["..."], "location": "...", "summary": "..."},'
+        '"experience": [{"title":"...","company":"...","dates":"...","description":"...","highlights":["..."]}],'
+        '"education": [{"degree":"...","institution":"...","dates":"..."}],'
+        '"skills": ["..."],'
+        '"projects": [], "publications": [], "awards": [], "certifications": [], "languages": [],'
+        '"extra_sections": [{"section":"...","items":["..."]}]'
+        "}"
     )
     user_prompt = (
-        "Extract resume information from this text and follow the schema strictly.\n\n"
-        f"{extraction_rules}\n"
-        f"Schema:\n{json.dumps(compact_schema, ensure_ascii=False)}\n\n"
+        "Extract as much information as possible from this resume text.\n"
+        "Do not lose data. Prefer filling extra_sections over dropping information.\n"
+        "If a field is unknown, use null or empty array.\n\n"
+        f"Suggested JSON shape:\n{raw_json_guide}\n\n"
         f"Resume text:\n{text}"
     )
 
@@ -477,6 +716,7 @@ def _extract_resume_direct_openai(text: str, model_id: str) -> ResumeExtraction:
         api_key=api_key,
         base_url=base_url.rstrip("/") if base_url else None,
     )
+    logger.info("model_id=%s base_url=%s", model_id, base_url or "default")
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -493,7 +733,7 @@ def _extract_resume_direct_openai(text: str, model_id: str) -> ResumeExtraction:
 
     parsed = _parse_json_dict_loose(content)
     if parsed is not None:
-        return _normalize_model_payload(parsed, text)
+        return _augment_raw_payload_with_text(parsed, text)
 
     # Retry once with explicit JSON-fix instruction for smaller models.
     repair_prompt = (
@@ -513,9 +753,25 @@ def _extract_resume_direct_openai(text: str, model_id: str) -> ResumeExtraction:
     repaired_content = (repair_resp.choices[0].message.content or "").strip()
     repaired = _parse_json_dict_loose(repaired_content)
     if repaired is not None:
-        return _normalize_model_payload(repaired, text)
+        return _augment_raw_payload_with_text(repaired, text)
 
     raise RuntimeError("Model response is not valid JSON")
+
+
+def extract_resume_with_raw(text: str) -> tuple[ResumeExtraction, dict[str, Any]]:
+    """
+    Two-step extraction:
+    1) Model produces a rich/free-form raw JSON (max information retention).
+    2) Deterministic normalization maps raw JSON to project schema.
+    """
+    if not (text or "").strip():
+        return ResumeExtraction(), {}
+
+    model_id = _get_model_id()
+    preprocessed_text = _preprocess_resume_text(text.strip())
+    raw_payload = _extract_raw_resume_json_openai(preprocessed_text, model_id)
+    normalized = _normalize_model_payload(raw_payload, preprocessed_text)
+    return normalized, raw_payload
 
 
 def extract_resume(text: str) -> ResumeExtraction:
@@ -527,6 +783,5 @@ def extract_resume(text: str) -> ResumeExtraction:
     """
     if not (text or "").strip():
         return ResumeExtraction()
-    model_id = _get_model_id()
-    preprocessed_text = _preprocess_resume_text(text.strip())
-    return _extract_resume_direct_openai(preprocessed_text, model_id)
+    result, _ = extract_resume_with_raw(text)
+    return result

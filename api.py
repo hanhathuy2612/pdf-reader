@@ -28,7 +28,7 @@ if os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes"):
 from fastapi import FastAPI, File, HTTPException, UploadFile
 
 from pdf_reader import extract_text_from_pdf
-from resume_extract import extract_resume
+from resume_extract import extract_resume_with_raw
 from schemas import ResumeExtraction
 
 logger = logging.getLogger("api")
@@ -51,7 +51,7 @@ def _slugify_filename(name: str) -> str:
     return safe or "resume"
 
 
-def _build_result_paths(original_filename: str) -> tuple[Path, Path]:
+def _build_result_paths(original_filename: str) -> tuple[Path, Path, Path]:
     RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_dir = RESULTS_ROOT / timestamp
@@ -59,18 +59,25 @@ def _build_result_paths(original_filename: str) -> tuple[Path, Path]:
 
     stem = _slugify_filename(Path(original_filename).stem)
     input_path = run_dir / f"{stem}_input-pdf.txt"
+    raw_path = run_dir / f"{stem}_raw-result.json"
     result_path = run_dir / f"{stem}_result.json"
-    return input_path, result_path
+    return input_path, raw_path, result_path
 
 
 def _write_debug_artifacts(
-    paths: tuple[Path, Path],
+    paths: tuple[Path, Path, Path],
     extracted_text: str,
+    raw_result: dict[str, Any] | None = None,
     result: ResumeExtraction | None = None,
 ) -> None:
     """Persist extracted text and JSON result under a per-run timestamp folder."""
-    input_path, result_path = paths
+    input_path, raw_path, result_path = paths
     input_path.write_text(extracted_text or "", encoding="utf-8")
+    if raw_result is not None:
+        raw_path.write_text(
+            json.dumps(raw_result, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
     if result is not None:
         result_path.write_text(
             json.dumps(result.model_dump(mode="json"), indent=2, ensure_ascii=False),
@@ -155,9 +162,9 @@ async def extract(
 
     try:
         t_llm_start = time.perf_counter()
-        result = extract_resume(text)
+        result, raw_result = extract_resume_with_raw(text)
         t_llm_s = time.perf_counter() - t_llm_start
-        _write_debug_artifacts(artifact_paths, text, result)
+        _write_debug_artifacts(artifact_paths, text, raw_result, result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Extraction failed: {e}")
 
