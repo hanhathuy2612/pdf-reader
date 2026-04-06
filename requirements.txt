@@ -1,4 +1,4 @@
-langextract[openai]
+openai
 pymupdf
 pdfplumber
 fastapi

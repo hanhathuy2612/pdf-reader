@@ -13,6 +13,7 @@ logger = logging.getLogger("resume_extract")
 JsonDict = dict[str, Any]
 ExperienceRow = dict[str, str | None]
 
+
 def _get_model_id() -> str:
     model = (os.environ.get("MODEL_ID") or "").strip()
     if model:
@@ -29,9 +30,7 @@ def _create_openai_client() -> tuple[Any, int | None]:
         ) from e
 
     base_url = (
-        os.environ.get("LM_STUDIO_BASE_URL")
-        or os.environ.get("OPENAI_BASE_URL")
-        or ""
+        os.environ.get("LM_STUDIO_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or ""
     ).strip()
     api_key = (os.environ.get("OPENAI_API_KEY") or "").strip() or "lm-studio"
     raw_max_tokens = (os.environ.get("LOCAL_MAX_OUTPUT_TOKENS") or "").strip()
@@ -41,6 +40,40 @@ def _create_openai_client() -> tuple[Any, int | None]:
         base_url=base_url.rstrip("/") if base_url else None,
     )
     return client, max_tokens
+
+
+def _request_chat_completion_with_json_schema_fallback(
+    client: Any,
+    request_args: JsonDict,
+    schema_name: str = "resume_payload",
+    schema: JsonDict | None = None,
+) -> Any:
+    """
+    Send a chat.completions request.
+
+    Some OpenAI-compatible backends return:
+    "JSON schema is missing in json-mode request"
+    unless response_format.json_schema is provided. In that case, retry once
+    with a permissive JSON schema so existing prompt behavior remains intact.
+    """
+    try:
+        return client.chat.completions.create(**request_args)
+    except Exception as exc:
+        message = str(exc).lower()
+        if "json schema is missing in json-mode request" not in message:
+            raise
+
+        fallback_schema = schema or {"type": "object", "additionalProperties": True}
+        retry_args = dict(request_args)
+        retry_args["response_format"] = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": False,
+                "schema": fallback_schema,
+            },
+        }
+        return client.chat.completions.create(**retry_args)
 
 
 _PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{7,}\d")
@@ -316,7 +349,9 @@ def _guess_name_from_text(text: str) -> str | None:
 
 def _build_raw_fallback_from_text(source_text: str) -> JsonDict:
     emails = _EMAIL_RE.findall(source_text or "")
-    phones = [_normalize_phone(m.group(0)) for m in _PHONE_RE.finditer(source_text or "")]
+    phones = [
+        _normalize_phone(m.group(0)) for m in _PHONE_RE.finditer(source_text or "")
+    ]
     phones = _dedup_keep_order([p for p in phones if _is_phone_like(p)])
     basics: JsonDict = {
         "name": _guess_name_from_text(source_text),
@@ -468,10 +503,7 @@ def _repair_with_text_fallback(data: JsonDict, source_text: str) -> JsonDict:
         repaired["experience"] = extracted_exp
         return repaired
 
-    existing_keys = {
-        _experience_identity(x)
-        for x in current_exp
-    }
+    existing_keys = {_experience_identity(x) for x in current_exp}
     for row in extracted_exp:
         key = _experience_identity(row)
         if key not in existing_keys:
@@ -595,13 +627,22 @@ def _coerce_raw_to_schema_dict(payload: JsonDict) -> JsonDict:
                 desc = _join_nonempty_text(highlights)
             item = {
                 "title": _pick_first_nonempty_str(
-                    row.get("title"), row.get("position"), row.get("role"), row.get("job_title")
+                    row.get("title"),
+                    row.get("position"),
+                    row.get("role"),
+                    row.get("job_title"),
                 ),
                 "company": _pick_first_nonempty_str(
-                    row.get("company"), row.get("employer"), row.get("organization"), row.get("org")
+                    row.get("company"),
+                    row.get("employer"),
+                    row.get("organization"),
+                    row.get("org"),
                 ),
                 "dates": _pick_first_nonempty_str(
-                    row.get("dates"), row.get("date_range"), row.get("period"), row.get("duration")
+                    row.get("dates"),
+                    row.get("date_range"),
+                    row.get("period"),
+                    row.get("duration"),
                 ),
                 "description": desc if isinstance(desc, str) else None,
             }
@@ -616,19 +657,33 @@ def _coerce_raw_to_schema_dict(payload: JsonDict) -> JsonDict:
                 continue
             item = {
                 "degree": _pick_first_nonempty_str(
-                    row.get("degree"), row.get("qualification"), row.get("program"), row.get("title")
+                    row.get("degree"),
+                    row.get("qualification"),
+                    row.get("program"),
+                    row.get("title"),
                 ),
                 "institution": _pick_first_nonempty_str(
-                    row.get("institution"), row.get("school"), row.get("university"), row.get("organization")
+                    row.get("institution"),
+                    row.get("school"),
+                    row.get("university"),
+                    row.get("organization"),
                 ),
                 "dates": _pick_first_nonempty_str(
-                    row.get("dates"), row.get("date_range"), row.get("period"), row.get("duration")
+                    row.get("dates"),
+                    row.get("date_range"),
+                    row.get("period"),
+                    row.get("duration"),
                 ),
             }
             if item["degree"] and item["institution"]:
                 education.append(item)
 
-    skills_source = data.get("skills") or data.get("core_skills") or data.get("technical_skills") or []
+    skills_source = (
+        data.get("skills")
+        or data.get("core_skills")
+        or data.get("technical_skills")
+        or []
+    )
     skills: list[str] = []
     if isinstance(skills_source, list):
         for row in skills_source:
@@ -731,8 +786,16 @@ def _normalize_model_payload(
         phone=data.get("phone"),
         phones=data.get("phones") or [],
         summary=data.get("summary"),
-        experience=[ExperienceItem(**x) for x in (data.get("experience") or []) if isinstance(x, dict)],
-        education=[EducationItem(**x) for x in (data.get("education") or []) if isinstance(x, dict)],
+        experience=[
+            ExperienceItem(**x)
+            for x in (data.get("experience") or [])
+            if isinstance(x, dict)
+        ],
+        education=[
+            EducationItem(**x)
+            for x in (data.get("education") or [])
+            if isinstance(x, dict)
+        ],
         skills=data.get("skills") or [],
     )
 
@@ -765,8 +828,12 @@ def _extract_raw_resume_json_openai(text: str, model_id: str) -> JsonDict:
     }
     if max_tokens is not None:
         request_args["max_tokens"] = max_tokens
-    resp = client.chat.completions.create(**request_args)
-    
+    resp = _request_chat_completion_with_json_schema_fallback(
+        client,
+        request_args,
+        schema_name="resume_raw_payload",
+    )
+
     content = (resp.choices[0].message.content or "").strip()
     if not content:
         raise RuntimeError("Model returned empty response")
@@ -791,7 +858,11 @@ def _extract_raw_resume_json_openai(text: str, model_id: str) -> JsonDict:
     }
     if max_tokens is not None:
         repair_args["max_tokens"] = max_tokens
-    repair_resp = client.chat.completions.create(**repair_args)
+    repair_resp = _request_chat_completion_with_json_schema_fallback(
+        client,
+        repair_args,
+        schema_name="resume_raw_payload_repair",
+    )
     repaired_content = (repair_resp.choices[0].message.content or "").strip()
     repaired = _parse_json_dict_loose(repaired_content)
     if repaired is not None:
@@ -819,7 +890,9 @@ def _normalize_raw_to_schema_openai(
                 "description": "string|null",
             }
         ],
-        "education": [{"degree": "string", "institution": "string", "dates": "string|null"}],
+        "education": [
+            {"degree": "string", "institution": "string", "dates": "string|null"}
+        ],
         "skills": ["string"],
     }
     system_prompt = (
@@ -848,7 +921,11 @@ def _normalize_raw_to_schema_openai(
     }
     if max_tokens is not None:
         request_args["max_tokens"] = max_tokens
-    resp = client.chat.completions.create(**request_args)
+    resp = _request_chat_completion_with_json_schema_fallback(
+        client,
+        request_args,
+        schema_name="resume_schema_payload",
+    )
     content = (resp.choices[0].message.content or "").strip()
     parsed = _parse_json_dict_loose(content)
     if parsed is not None:
@@ -869,8 +946,14 @@ def _normalize_raw_to_schema_openai(
     }
     if max_tokens is not None:
         repair_args["max_tokens"] = max_tokens
-    repair_resp = client.chat.completions.create(**repair_args)
-    repaired = _parse_json_dict_loose((repair_resp.choices[0].message.content or "").strip())
+    repair_resp = _request_chat_completion_with_json_schema_fallback(
+        client,
+        repair_args,
+        schema_name="resume_schema_payload_repair",
+    )
+    repaired = _parse_json_dict_loose(
+        (repair_resp.choices[0].message.content or "").strip()
+    )
     if repaired is not None:
         return repaired
     raise RuntimeError("Model response is not valid JSON")
