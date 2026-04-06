@@ -1,4 +1,4 @@
-"""Minimal resume extraction via OpenAI-compatible chat completion."""
+"""Minimal resume extraction with selectable LLM provider."""
 
 import json
 import logging
@@ -21,20 +21,63 @@ def _get_model_id() -> str:
     return "qwen2.5-14b-instruct-1m"
 
 
-def _create_openai_client() -> tuple[Any, int | None]:
+def _get_provider() -> str:
+    provider = (os.environ.get("LLM_PROVIDER") or "anthropic").strip().lower()
+    if provider not in {"anthropic", "openai"}:
+        raise RuntimeError(
+            "Invalid LLM_PROVIDER. Use 'anthropic' or 'openai'."
+        )
+    return provider
+
+
+def _create_anthropic_client() -> tuple[Any, int]:
+    try:
+        from anthropic import Anthropic
+    except ImportError as e:
+        raise RuntimeError("anthropic package is required. Run: pip install anthropic") from e
+
+    base_url = (
+        os.environ.get("ANTHROPIC_BASE_URL")
+        or os.environ.get("LM_STUDIO_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or ""
+    ).strip()
+    normalized_base_url = base_url.rstrip("/")
+    if normalized_base_url.endswith("/v1"):
+        normalized_base_url = normalized_base_url[: -len("/v1")]
+    api_key = (
+        (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+        or (os.environ.get("OPENAI_API_KEY") or "").strip()
+        or "lm-studio"
+    )
+    raw_max_tokens = (os.environ.get("LOCAL_MAX_OUTPUT_TOKENS") or "").strip()
+    max_tokens = int(raw_max_tokens) if raw_max_tokens else 4096
+    client = Anthropic(
+        api_key=api_key,
+        base_url=normalized_base_url if normalized_base_url else None,
+    )
+    return client, max_tokens
+
+
+def _create_openai_client() -> tuple[Any, int]:
     try:
         from openai import OpenAI
     except ImportError as e:
-        raise RuntimeError(
-            "openai package is required. Run: pip install langextract[openai]"
-        ) from e
+        raise RuntimeError("openai package is required. Run: pip install openai") from e
 
     base_url = (
-        os.environ.get("LM_STUDIO_BASE_URL") or os.environ.get("OPENAI_BASE_URL") or ""
+        os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get("LM_STUDIO_BASE_URL")
+        or os.environ.get("ANTHROPIC_BASE_URL")
+        or ""
     ).strip()
-    api_key = (os.environ.get("OPENAI_API_KEY") or "").strip() or "lm-studio"
+    api_key = (
+        (os.environ.get("OPENAI_API_KEY") or "").strip()
+        or (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+        or "lm-studio"
+    )
     raw_max_tokens = (os.environ.get("LOCAL_MAX_OUTPUT_TOKENS") or "").strip()
-    max_tokens = int(raw_max_tokens) if raw_max_tokens else None
+    max_tokens = int(raw_max_tokens) if raw_max_tokens else 4096
     client = OpenAI(
         api_key=api_key,
         base_url=base_url.rstrip("/") if base_url else None,
@@ -42,38 +85,125 @@ def _create_openai_client() -> tuple[Any, int | None]:
     return client, max_tokens
 
 
-def _request_chat_completion_with_json_schema_fallback(
+def _extract_text_from_anthropic_message(response: Any) -> str:
+    blocks = getattr(response, "content", None)
+    if not isinstance(blocks, list):
+        return ""
+    texts: list[str] = []
+    for block in blocks:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text.strip():
+            texts.append(text.strip())
+    return "\n".join(texts).strip()
+
+
+def _anthropic_messages_create(
     client: Any,
-    request_args: JsonDict,
+    model_id: str,
+    system_prompt: str,
+    messages: list[JsonDict],
+    max_tokens: int,
     schema_name: str = "resume_payload",
-    schema: JsonDict | None = None,
-) -> Any:
-    """
-    Send a chat.completions request.
-
-    Some OpenAI-compatible backends return:
-    "JSON schema is missing in json-mode request"
-    unless response_format.json_schema is provided. In that case, retry once
-    with a permissive JSON schema so existing prompt behavior remains intact.
-    """
+) -> str:
     try:
-        return client.chat.completions.create(**request_args)
+        response = client.messages.create(
+            model=model_id,
+            max_tokens=max_tokens,
+            temperature=0,
+            system=system_prompt,
+            messages=messages,
+        )
+        return _extract_text_from_anthropic_message(response)
     except Exception as exc:
-        message = str(exc).lower()
-        if "json schema is missing in json-mode request" not in message:
+        if "json schema is missing in json-mode request" not in str(exc).lower():
             raise
+        logger.info("Anthropic /v1/messages requires json_schema; falling back to /v1/chat/completions")
+        return _raw_chat_completion_fallback(
+            client=client,
+            model_id=model_id,
+            system_prompt=system_prompt,
+            messages=messages,
+            max_tokens=max_tokens,
+            schema_name=schema_name,
+        )
 
-        fallback_schema = schema or {"type": "object", "additionalProperties": True}
+
+def _raw_chat_completion_fallback(
+    client: Any,
+    model_id: str,
+    system_prompt: str,
+    messages: list[JsonDict],
+    max_tokens: int,
+    schema_name: str = "resume_payload",
+) -> str:
+    """Fallback: call /v1/chat/completions via raw httpx when the Anthropic
+    /v1/messages endpoint rejects requests without json_schema."""
+    import httpx
+
+    base_url = str(client.base_url or "").rstrip("/")
+    if not base_url:
+        base_url = "http://127.0.0.1:1234"
+    url = f"{base_url}/v1/chat/completions"
+
+    payload: JsonDict = {
+        "model": model_id,
+        "messages": [{"role": "system", "content": system_prompt}, *messages],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema_name,
+                "strict": False,
+                "schema": {"type": "object", "additionalProperties": True},
+            },
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {client.api_key or 'lm-studio'}",
+    }
+    with httpx.Client(timeout=httpx.Timeout(connect=10, read=600, write=60, pool=60)) as http:
+        resp = http.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+    return (
+        resp.json()
+        .get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    ).strip()
+
+
+def _openai_messages_create(
+    client: Any,
+    model_id: str,
+    system_prompt: str,
+    messages: list[JsonDict],
+    max_tokens: int,
+    schema_name: str = "resume_payload",
+) -> str:
+    request_args: JsonDict = {
+        "model": model_id,
+        "messages": [{"role": "system", "content": system_prompt}, *messages],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    try:
+        resp = client.chat.completions.create(**request_args)
+    except Exception as exc:
+        if "json schema is missing in json-mode request" not in str(exc).lower():
+            raise
         retry_args = dict(request_args)
         retry_args["response_format"] = {
             "type": "json_schema",
             "json_schema": {
                 "name": schema_name,
                 "strict": False,
-                "schema": fallback_schema,
+                "schema": {"type": "object", "additionalProperties": True},
             },
         }
-        return client.chat.completions.create(**retry_args)
+        resp = client.chat.completions.create(**retry_args)
+    return (resp.choices[0].message.content or "").strip()
 
 
 _PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{7,}\d")
@@ -83,8 +213,10 @@ _MONTH_TOKEN = (
     r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|"
     r"January|February|March|April|May|June|July|August|September|October|November|December)"
 )
+_DATE_PART = rf"(?:{_MONTH_TOKEN},?\s+\d{{4}}|\d{{4}})"
 _DATE_RANGE_RE = re.compile(
-    rf"(?:{_MONTH_TOKEN}\s+\d{{4}}\s*[–-]\s*(?:{_MONTH_TOKEN}\s+\d{{4}}|Present))|(?:…\s*[–-]\s*\d{{4}})"
+    rf"(?:{_DATE_PART}\s*(?:[–-]|to)\s*(?:{_DATE_PART}|Present|Current))|(?:…\s*[–-]\s*\d{{4}})",
+    flags=re.I,
 )
 _KNOWN_SECTIONS: dict[str, str] = {
     "work experience": "WORK_EXPERIENCE",
@@ -418,12 +550,35 @@ def _extract_experience_headers(text: str) -> list[ExperienceRow]:
         date_match = _DATE_RANGE_RE.search(line)
         if not date_match:
             continue
-        # Fallback parser should only consume lines that are mostly a date range.
-        if date_match.group(0).strip() != line.strip():
-            continue
 
         company: str | None = None
         title: str | None = None
+        dates = date_match.group(0).strip()
+
+        # Inline format: "Company Name (Jan 2008 to Aug, 2012)".
+        if dates != line.strip():
+            company_prefix = line[: date_match.start()].strip()
+            company_prefix = re.sub(r"[\(\[\{]+$", "", company_prefix).strip(" ,;-")
+            if _is_probable_company(company_prefix):
+                company = company_prefix
+                for k in range(i - 1, max(-1, i - 8), -1):
+                    maybe_title = lines[k]
+                    if maybe_title.startswith(("[SECTION:", "- ")):
+                        continue
+                    if _is_probable_role_title(maybe_title):
+                        title = maybe_title
+                        break
+                if title and company:
+                    rows.append(
+                        {
+                            "title": title,
+                            "company": company,
+                            "dates": dates,
+                            "description": None,
+                        }
+                    )
+            # Continue to next line after inline handling.
+            continue
 
         # Prefer a title->company pair directly above the date line.
         for j in range(i - 2, max(-1, i - 12), -1):
@@ -460,7 +615,7 @@ def _extract_experience_headers(text: str) -> list[ExperienceRow]:
                 {
                     "title": title,
                     "company": company,
-                    "dates": line,
+                    "dates": dates,
                     "description": None,
                 }
             )
@@ -800,82 +955,34 @@ def _normalize_model_payload(
     )
 
 
-def _extract_raw_resume_json_openai(text: str, model_id: str) -> JsonDict:
-    """Step 1: ask model to return a rich, free-form resume JSON (lossless-first)."""
-    client, max_tokens = _create_openai_client()
-    logger.info("using model_id=%s for raw extraction", model_id)
-
-    system_prompt = (
-        "You extract resume information from noisy PDF text. "
-        "Return one valid JSON object only (no markdown, no prose)."
-    )
-    user_prompt = (
-        "Extract as much information as possible from this resume text.\n"
-        "Return one JSON object with your own best structure.\n"
-        "Do not lose data and do not add markdown/prose.\n"
-        "Use null/empty arrays only when information is missing.\n\n"
-        f"Resume text:\n{text}"
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    request_args: JsonDict = {
-        "model": model_id,
-        "messages": messages,
-        "temperature": 0,
-    }
-    if max_tokens is not None:
-        request_args["max_tokens"] = max_tokens
-    resp = _request_chat_completion_with_json_schema_fallback(
-        client,
-        request_args,
-        schema_name="resume_raw_payload",
-    )
-
-    content = (resp.choices[0].message.content or "").strip()
-    if not content:
-        raise RuntimeError("Model returned empty response")
-
-    parsed = _parse_json_dict_loose(content)
-    if parsed is not None:
-        return parsed
-
-    # Retry once with explicit JSON-fix instruction for smaller models.
-    repair_prompt = (
-        "Rewrite the previous assistant output as strict valid JSON only. "
-        "Do not add or remove keys. Return one JSON object."
-    )
-    repair_args: JsonDict = {
-        "model": model_id,
-        "messages": [
-            *messages,
-            {"role": "assistant", "content": content},
-            {"role": "user", "content": repair_prompt},
-        ],
-        "temperature": 0,
-    }
-    if max_tokens is not None:
-        repair_args["max_tokens"] = max_tokens
-    repair_resp = _request_chat_completion_with_json_schema_fallback(
-        client,
-        repair_args,
-        schema_name="resume_raw_payload_repair",
-    )
-    repaired_content = (repair_resp.choices[0].message.content or "").strip()
-    repaired = _parse_json_dict_loose(repaired_content)
-    if repaired is not None:
-        return repaired
-
-    raise RuntimeError("Model response is not valid JSON")
-
-
-def _normalize_raw_to_schema_openai(
-    raw_payload: JsonDict, source_text: str, model_id: str
+def _extract_to_schema_single_pass(
+    source_text: str, model_id: str, provider: str
 ) -> JsonDict:
-    """Step 2: normalize raw JSON to strict project schema via prompt."""
-    client, max_tokens = _create_openai_client()
+    """
+    Fast path: one extraction call directly to target schema (+ one repair retry).
+    This reduces latency versus the two-step raw->normalize pipeline.
+    """
+    if provider == "anthropic":
+        client, max_tokens = _create_anthropic_client()
+        call_model = lambda msgs, schema_name: _anthropic_messages_create(
+            client=client,
+            model_id=model_id,
+            system_prompt=system_prompt,
+            messages=msgs,
+            max_tokens=max_tokens,
+            schema_name=schema_name,
+        )
+    else:
+        client, max_tokens = _create_openai_client()
+        call_model = lambda msgs, schema_name: _openai_messages_create(
+            client=client,
+            model_id=model_id,
+            system_prompt=system_prompt,
+            messages=msgs,
+            max_tokens=max_tokens,
+            schema_name=schema_name,
+        )
+
     schema_guide = {
         "name": "string|null",
         "email": "string|null",
@@ -896,37 +1003,22 @@ def _normalize_raw_to_schema_openai(
         "skills": ["string"],
     }
     system_prompt = (
-        "You normalize resume data into a strict target JSON schema. "
-        "Return one valid JSON object only."
+        "You are an information extraction system. "
+        "Return one valid JSON object only (no markdown, no prose)."
     )
     user_prompt = (
-        "Map RAW_JSON into TARGET_SCHEMA.\n"
+        "Extract resume data into TARGET_SCHEMA.\n"
         "Rules:\n"
-        "1) Keep as much mappable information as possible.\n"
-        "2) Do not invent facts. Use SOURCE_TEXT only for disambiguation.\n"
-        "3) Preserve all valid experience and education entries.\n"
-        "4) If an entry misses required fields and cannot be inferred, drop that entry only.\n"
-        "5) Return strict JSON only.\n\n"
+        "1) Do not invent facts.\n"
+        "2) Keep as much mappable information as possible.\n"
+        "3) If unknown, use null or empty arrays.\n"
+        "4) Return strict JSON only.\n\n"
         f"TARGET_SCHEMA:\n{json.dumps(schema_guide, ensure_ascii=False)}\n\n"
-        f"RAW_JSON:\n{json.dumps(raw_payload, ensure_ascii=False)}\n\n"
+        f"RESUME_TEXT:\n{source_text}\n"
     )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    request_args: JsonDict = {
-        "model": model_id,
-        "messages": messages,
-        "temperature": 0,
-    }
-    if max_tokens is not None:
-        request_args["max_tokens"] = max_tokens
-    resp = _request_chat_completion_with_json_schema_fallback(
-        client,
-        request_args,
-        schema_name="resume_schema_payload",
-    )
-    content = (resp.choices[0].message.content or "").strip()
+    messages = [{"role": "user", "content": user_prompt}]
+
+    content = call_model(messages, "resume_single_pass")
     parsed = _parse_json_dict_loose(content)
     if parsed is not None:
         return parsed
@@ -935,25 +1027,15 @@ def _normalize_raw_to_schema_openai(
         "Rewrite the previous assistant output as strict valid JSON for TARGET_SCHEMA. "
         "Return one JSON object only."
     )
-    repair_args: JsonDict = {
-        "model": model_id,
-        "messages": [
+    repaired_content = call_model(
+        [
             *messages,
             {"role": "assistant", "content": content},
             {"role": "user", "content": repair_prompt},
         ],
-        "temperature": 0,
-    }
-    if max_tokens is not None:
-        repair_args["max_tokens"] = max_tokens
-    repair_resp = _request_chat_completion_with_json_schema_fallback(
-        client,
-        repair_args,
-        schema_name="resume_schema_payload_repair",
+        "resume_single_pass_repair",
     )
-    repaired = _parse_json_dict_loose(
-        (repair_resp.choices[0].message.content or "").strip()
-    )
+    repaired = _parse_json_dict_loose(repaired_content)
     if repaired is not None:
         return repaired
     raise RuntimeError("Model response is not valid JSON")
@@ -961,35 +1043,32 @@ def _normalize_raw_to_schema_openai(
 
 def extract_resume_with_raw(text: str) -> tuple[ResumeExtraction, dict[str, Any]]:
     """
-    Two-step extraction:
-    1) Model produces a rich/free-form raw JSON (max information retention).
-    2) Prompt-based normalization maps raw JSON to project schema.
+    Fast extraction:
+    1) Model extracts directly to target schema in one pass.
+    2) If JSON is malformed, retry once with JSON-fix prompt.
     """
     if not (text or "").strip():
         return ResumeExtraction(), {}
 
+    provider = _get_provider()
     model_id = _get_model_id()
     preprocessed_text = _preprocess_resume_text(text.strip())
-    raw_payload = _extract_raw_resume_json_openai(preprocessed_text, model_id)
-    try:
-        normalized_payload = _normalize_raw_to_schema_openai(
-            raw_payload, preprocessed_text, model_id
-        )
-        normalized = _normalize_model_payload(
-            normalized_payload, preprocessed_text, apply_text_fallback=True
-        )
-    except Exception:
-        # Safe fallback if step-2 model normalization fails.
-        normalized = _normalize_model_payload(raw_payload, preprocessed_text)
-    return normalized, raw_payload
+    normalized_payload = _extract_to_schema_single_pass(
+        preprocessed_text, model_id, provider
+    )
+    normalized = _normalize_model_payload(
+        normalized_payload, preprocessed_text, apply_text_fallback=True
+    )
+    # raw payload is schema-shaped in fast-only mode.
+    return normalized, normalized_payload
 
 
 def extract_resume(text: str) -> ResumeExtraction:
     """
     Extract structured resume data from plain text.
 
-    Uses LM Studio OpenAI-compatible chat completion.
-    Set LM_STUDIO_BASE_URL and OPENAI_API_KEY.
+    Uses the configured provider via LLM_PROVIDER.
+    Supported: anthropic (messages API) or openai (chat completions API).
     """
     if not (text or "").strip():
         return ResumeExtraction()

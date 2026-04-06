@@ -169,12 +169,14 @@ async def extract(
         raise HTTPException(status_code=500, detail=f"Extraction failed: {e}")
 
     t_total_s = time.perf_counter() - t0
+    model_id = (os.environ.get("MODEL_ID") or "").strip() or "unknown"
     logger.info(
         (
-            "extract completed | file=%s | bytes=%d | chars=%d | "
+            "extract completed | file=%s | model=%s | bytes=%d | chars=%d | "
             "timings={pdf: %.3fs, llm: %.3fs, total: %.3fs}"
         ),
         file.filename,
+        model_id,
         len(raw),
         len(text or ""),
         t_pdf_s,
