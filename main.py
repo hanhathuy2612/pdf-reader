@@ -1,5 +1,8 @@
+from io import BytesIO
+
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from openai import OpenAI
+from PIL import Image, ImageSequence
 from pydantic import BaseModel
 import base64
 import json
@@ -192,10 +195,66 @@ def pdf_to_png_data_urls(pdf_bytes: bytes) -> list[str]:
         doc.close()
 
 
-def call_llm_with_resume_images(image_data_urls: list[str], filename: str) -> str:
+def _frame_to_png_data_url(frame: Image.Image) -> str:
+    rgb = frame.convert("RGB")
+    buf = BytesIO()
+    rgb.save(buf, format="PNG", optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
+
+
+def raster_image_to_png_data_urls(image_bytes: bytes) -> list[str]:
+    """Decode raster image(s) (PNG, JPEG, WebP, GIF, BMP, multi-page TIFF, …) to PNG data URLs."""
+    try:
+        im = Image.open(BytesIO(image_bytes))
+        im.load()
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not decode image: {e}",
+        ) from e
+
+    urls: list[str] = []
+    for i, frame in enumerate(ImageSequence.Iterator(im)):
+        if i >= PDF_MAX_PAGES:
+            break
+        urls.append(_frame_to_png_data_url(frame))
+
+    if not urls:
+        raise HTTPException(status_code=400, detail="Image has no frames")
+
+    return urls
+
+
+def bytes_to_resume_image_data_urls(raw: bytes) -> tuple[list[str], str]:
+    """
+    Build model-ready image data URLs from PDF bytes or raster image bytes.
+    Returns (urls, source_label) where source_label is 'pdf' or 'image'.
+    """
+    if len(raw) >= 4 and raw[:4] == b"%PDF":
+        try:
+            return pdf_to_png_data_urls(raw), "pdf"
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid or unreadable PDF: {e}",
+            ) from e
+    return raster_image_to_png_data_urls(raw), "image"
+
+
+def call_llm_with_resume_images(
+    image_data_urls: list[str],
+    filename: str,
+    source: str,
+) -> str:
+    source_note = (
+        "The images are rendered pages of a PDF resume"
+        if source == "pdf"
+        else "The images are from an uploaded resume image file (one or more frames/pages)"
+    )
     instruction = f"""You are an expert in extracting structured data from resume/CV documents.
 
-The images are rendered pages of a PDF resume (file: {filename}), in order (page 1 first).
+{source_note} (file: {filename}), in order (page 1 first).
 
 Extract:
 - name
@@ -261,16 +320,20 @@ def safe_json_parse(content: str):
 @app.post("/parse-cv")
 async def parse_cv(file: UploadFile = File(...)):
     t0 = time.perf_counter()
-    pdf_bytes = await file.read()
-    if not pdf_bytes:
+    raw = await file.read()
+    if not raw:
         raise HTTPException(status_code=400, detail="Empty file")
 
     t_render = time.perf_counter()
-    image_urls = pdf_to_png_data_urls(pdf_bytes)
+    image_urls, source = bytes_to_resume_image_data_urls(raw)
     render_s = time.perf_counter() - t_render
 
     t_llm = time.perf_counter()
-    llm_output = call_llm_with_resume_images(image_urls, file.filename or "resume.pdf")
+    llm_output = call_llm_with_resume_images(
+        image_urls,
+        file.filename or f"resume.{source}",
+        source,
+    )
     llm_s = time.perf_counter() - t_llm
 
     data = safe_json_parse(llm_output)
@@ -278,9 +341,10 @@ async def parse_cv(file: UploadFile = File(...)):
 
     total_seconds = time.perf_counter() - t0
     logger.info(
-        "parse-cv completed | file=%s | model=%s | pages=%d | "
+        "parse-cv completed | file=%s | source=%s | model=%s | images=%d | "
         "timings={render: %.3fs, llm: %.3fs, total: %.3fs, total_minutes: %.2f}",
         file.filename,
+        source,
         MODEL_ID,
         len(image_urls),
         render_s,

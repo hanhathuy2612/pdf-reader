@@ -1,6 +1,6 @@
 # pdf-reader (CV from PDF)
 
-Small API: accepts a CV PDF, renders each page to PNG, sends images to LM Studio (OpenAI-compatible), returns structured JSON (name, email, phone, skills, education, experience).
+Small API: accepts a **CV as PDF or raster image** (PNG, JPEG, WebP, GIF, BMP, multi-page TIFF, …). PDFs are rendered to PNG per page; images are normalized to PNG. Those images are sent to LM Studio (OpenAI-compatible); response is structured JSON (name, email, phone, skills, education, experience).
 
 > **Note — VL model required.** This app sends **images** (PNG pages), not raw PDF text. You **must** load a **vision-language (VL)** model in LM Studio (e.g. Qwen2.5-VL, LLaVA). A text-only instruct model will not read the images and extraction will fail or be useless.
 
@@ -33,13 +33,13 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 ## API
 
-`POST /parse-cv` — `multipart/form-data` with field `file` (PDF).
+`POST /parse-cv` — `multipart/form-data` with field `file`: a **PDF** or a **raster image** (e.g. a phone photo of a resume).
 
-Example:
+Examples:
 
 ```bash
-curl -s -X POST "http://localhost:8000/parse-cv" \
-  -F "file=@./resume.pdf"
+curl -s -X POST "http://localhost:8000/parse-cv" -F "file=@./resume.pdf"
+curl -s -X POST "http://localhost:8000/parse-cv" -F "file=@./resume.png"
 ```
 
 ## Environment variables (optional)
@@ -49,8 +49,8 @@ curl -s -X POST "http://localhost:8000/parse-cv" \
 | `MODEL_ID` | `qwen2.5-7b-instruct` | **Use a VL model id** (must match LM Studio). Default is text-only — change it. |
 | `OPENAI_BASE_URL` | `http://localhost:1234/v1` | API base URL |
 | `OPENAI_API_KEY` | `lm-studio` | API key (LM Studio is often lenient) |
-| `PDF_MAX_PAGES` | `15` | Max pages sent to the model |
-| `PDF_RENDER_ZOOM` | `2.0` | Render scale for PNG (lower if you hit context limits) |
+| `PDF_MAX_PAGES` | `15` | Max PDF pages **or** image frames (e.g. TIFF) sent to the model |
+| `PDF_RENDER_ZOOM` | `2.0` | PDF render scale only (lower if you hit context limits) |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
-If the PDF is long or you get context errors, lower `PDF_MAX_PAGES` or `PDF_RENDER_ZOOM`.
+If the document is long or you get context errors, lower `PDF_MAX_PAGES` or `PDF_RENDER_ZOOM` (PDF only).

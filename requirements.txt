@@ -1,6 +1,7 @@
 anthropic
 openai
 pymupdf
+Pillow
 fastapi
 uvicorn[standard]
 python-multipart
