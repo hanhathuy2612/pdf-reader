@@ -1,7 +1,6 @@
 anthropic
 openai
 pymupdf
-pdfplumber
 fastapi
 uvicorn[standard]
 python-multipart

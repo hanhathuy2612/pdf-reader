@@ -1,114 +1,292 @@
-"""
-Run the API server or CLI for local PDF extraction.
-
-Usage:
-  API server:  python main.py [--reload]
-  CLI extract: python main.py extract <path-to-resume.pdf> [--output out.json]
-"""
-
-import argparse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from openai import OpenAI
+from pydantic import BaseModel
+import base64
 import json
-import re
-import sys
-from datetime import datetime
-from pathlib import Path
+import logging
+import os
+import time
+from dotenv import load_dotenv
 
-from pdf_reader import extract_text_from_pdf
-from resume_extract import extract_resume_with_raw
+import fitz  # PyMuPDF
 
-ARTIFACTS_DIR = Path(__file__).resolve().parent
-RESULTS_ROOT = ARTIFACTS_DIR / "result"
+app = FastAPI()
+logger = logging.getLogger("cv_parser")
+
+load_dotenv()
+
+LOG_LEVEL = (os.environ.get("LOG_LEVEL") or "INFO").upper().strip()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+MODEL_ID = (os.environ.get("MODEL_ID") or "qwen2.5-7b-instruct").strip()
+OPENAI_BASE_URL = (
+    os.environ.get("OPENAI_BASE_URL") or "http://localhost:1234/v1"
+).strip()
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "lm-studio").strip()
+
+PDF_MAX_PAGES = int((os.environ.get("PDF_MAX_PAGES") or "15").strip() or "15")
+PDF_RENDER_ZOOM = float((os.environ.get("PDF_RENDER_ZOOM") or "2.0").strip() or "2.0")
+
+# LM Studio OpenAI-compatible client
+client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
 
 
-def _slugify_filename(name: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "").strip())
-    safe = safe.strip("._-")
-    return safe or "resume"
+CV_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "cv_extraction",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "name": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "email": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "phone": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "skills": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"},
+                    ],
+                    "items": {"type": "string"},
+                },
+                "education": {
+                    "anyOf": [
+                        {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "school": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {"type": "null"},
+                                        ]
+                                    },
+                                    "degree": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {"type": "null"},
+                                        ]
+                                    },
+                                    "year": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {"type": "null"},
+                                        ]
+                                    },
+                                },
+                                "required": ["school", "degree", "year"],
+                                "additionalProperties": True,
+                            },
+                        },
+                        {"type": "null"},
+                    ],
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "school": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "degree": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "year": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                        },
+                        "required": ["school", "degree", "year"],
+                        "additionalProperties": True,
+                    },
+                },
+                "experience": {
+                    "anyOf": [
+                        {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "company": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {"type": "null"},
+                                        ]
+                                    },
+                                    "role": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {"type": "null"},
+                                        ]
+                                    },
+                                    "duration": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {"type": "null"},
+                                        ]
+                                    },
+                                    "description": {
+                                        "anyOf": [
+                                            {"type": "string"},
+                                            {"type": "null"},
+                                        ]
+                                    },
+                                },
+                                "required": [
+                                    "company",
+                                    "role",
+                                    "duration",
+                                    "description",
+                                ],
+                                "additionalProperties": True,
+                            },
+                        },
+                        {"type": "null"},
+                    ],
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "company": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}]
+                            },
+                            "role": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "duration": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}]
+                            },
+                            "description": {
+                                "anyOf": [{"type": "string"}, {"type": "null"}]
+                            },
+                        },
+                        "required": ["company", "role", "duration", "description"],
+                        "additionalProperties": True,
+                    },
+                },
+            },
+            "required": ["name", "email", "phone", "skills", "education", "experience"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
-def _build_result_paths(pdf_path: Path) -> tuple[Path, Path, Path]:
-    RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    run_dir = RESULTS_ROOT / timestamp
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    stem = _slugify_filename(pdf_path.stem)
-    input_path = run_dir / f"{stem}_input-pdf.txt"
-    raw_path = run_dir / f"{stem}_raw-result.json"
-    result_path = run_dir / f"{stem}_result.json"
-    return input_path, raw_path, result_path
+class CV(BaseModel):
+    name: str | None
+    email: str | None
+    phone: str | None
+    skills: list[str] | None
+    education: list[dict] | None
+    experience: list[dict] | None
 
 
-def cmd_extract(pdf_path: str, output_path: str | None) -> int:
-    """Extract resume JSON from a PDF file and print or write to file."""
-    path = Path(pdf_path)
+def pdf_to_png_data_urls(pdf_bytes: bytes) -> list[str]:
+    """Render each PDF page to PNG and return data:image/png;base64,... URLs."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        text = extract_text_from_pdf(path)
-    except FileNotFoundError:
-        print(f"Error: file not found: {path}", file=sys.stderr)
-        return 1
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
+        n = min(doc.page_count, max(1, PDF_MAX_PAGES))
+        mat = fitz.Matrix(PDF_RENDER_ZOOM, PDF_RENDER_ZOOM)
+        urls: list[str] = []
+        for i in range(n):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            png_bytes = pix.tobytes("png")
+            b64 = base64.b64encode(png_bytes).decode("ascii")
+            urls.append(f"data:image/png;base64,{b64}")
+        return urls
+    finally:
+        doc.close()
 
-    input_path, raw_path, result_path = _build_result_paths(path)
-    input_path.write_text(text or "", encoding="utf-8")
 
-    try:
-        result, raw_result = extract_resume_with_raw(text)
-    except Exception as e:
-        print(f"Extraction error: {e}", file=sys.stderr)
-        return 1
+def call_llm_with_resume_images(image_data_urls: list[str], filename: str) -> str:
+    instruction = f"""You are an expert in extracting structured data from resume/CV documents.
 
-    raw_path.write_text(
-        json.dumps(raw_result, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+The images are rendered pages of a PDF resume (file: {filename}), in order (page 1 first).
+
+Extract:
+- name
+- email
+- phone
+- skills (array)
+- education (array of {{school, degree, year}})
+- experience (array of {{company, role, duration, description}})
+
+Rules:
+- Read text from the images (including scanned PDFs).
+- Return ONLY valid JSON matching the enforced schema.
+- No explanation or markdown.
+- Missing field → null
+"""
+
+    content: list[dict] = [{"type": "text", "text": instruction}]
+    for idx, url in enumerate(image_data_urls):
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": url},
+            }
+        )
+        # tiny label helps some models separate pages
+        content.append(
+            {
+                "type": "text",
+                "text": f"(image above: page {idx + 1} of {len(image_data_urls)})",
+            }
+        )
+
+    response = client.chat.completions.create(
+        model=MODEL_ID,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a JSON extraction engine. Use the resume page images.",
+            },
+            {"role": "user", "content": content},
+        ],
+        response_format=CV_RESPONSE_FORMAT,
+        temperature=0,
     )
-    data = result.model_dump(mode="json")
-    json_str = json.dumps(data, indent=2, ensure_ascii=False)
-    result_path.write_text(json_str, encoding="utf-8")
 
-    if output_path:
-        Path(output_path).write_text(json_str, encoding="utf-8")
-        print(f"Wrote {output_path}")
-    else:
-        print(json_str)
-    return 0
+    return response.choices[0].message.content or ""
 
 
-def cmd_serve(reload: bool = False) -> None:
-    """Run the FastAPI app with uvicorn."""
-    import os
-
-    os.environ["RELOAD"] = "1" if reload else "0"
-    from api import run_app
-
-    run_app()
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="ATS PDF Reader: API server or CLI extract")
-    sub = parser.add_subparsers(dest="command", help="Command")
-
-    serve_p = sub.add_parser("serve", help="Run the API server (default)")
-    serve_p.add_argument("--reload", action="store_true", help="Enable uvicorn reload")
-    serve_p.set_defaults(cmd="serve")
-
-    extract_p = sub.add_parser("extract", help="Extract resume JSON from a PDF file")
-    extract_p.add_argument("pdf_path", help="Path to resume PDF")
-    extract_p.add_argument("--output", "-o", help="Write JSON to file (default: stdout)")
-    extract_p.set_defaults(cmd="extract")
-
-    args = parser.parse_args()
-
-    if args.command == "extract":
-        return cmd_extract(args.pdf_path, getattr(args, "output", None))
-    if args.command == "serve" or args.command is None:
-        cmd_serve(reload=getattr(args, "reload", False))
-        return 0
-    parser.print_help()
-    return 0
+def safe_json_parse(content: str):
+    try:
+        return json.loads(content)
+    except Exception:
+        fix_prompt = f"Fix this JSON:\n{content}"
+        retry = client.chat.completions.create(
+            model=MODEL_ID,
+            messages=[{"role": "user", "content": fix_prompt}],
+            response_format=CV_RESPONSE_FORMAT,
+            temperature=0,
+        )
+        return json.loads(retry.choices[0].message.content or "{}")
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+@app.post("/parse-cv")
+async def parse_cv(file: UploadFile = File(...)):
+    t0 = time.perf_counter()
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    t_render = time.perf_counter()
+    image_urls = pdf_to_png_data_urls(pdf_bytes)
+    render_s = time.perf_counter() - t_render
+
+    t_llm = time.perf_counter()
+    llm_output = call_llm_with_resume_images(image_urls, file.filename or "resume.pdf")
+    llm_s = time.perf_counter() - t_llm
+
+    data = safe_json_parse(llm_output)
+    cv = CV(**data)
+
+    total_seconds = time.perf_counter() - t0
+    logger.info(
+        "parse-cv completed | file=%s | model=%s | pages=%d | "
+        "timings={render: %.3fs, llm: %.3fs, total: %.3fs, total_minutes: %.2f}",
+        file.filename,
+        MODEL_ID,
+        len(image_urls),
+        render_s,
+        llm_s,
+        total_seconds,
+        total_seconds / 60.0,
+    )
+
+    return cv
